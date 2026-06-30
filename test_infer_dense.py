@@ -30,22 +30,25 @@ MODEL = "qwen3-vl"
 DEFAULT_IMG = "test.jpeg"
 
 # Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
-DB = Path(__file__).resolve().parent / "pct" / "pct_corpus.db"
+DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DIM = 384
 
 # --- Hierarchical (dense-emb) cascade knobs -------------------------------
 # Query drills down one HS level at a time against the `embedding_own` vectors
 # (each row embedded on its OWN text, top parents discarded — see
-# build_embeddings.own_description). Stages: chapter -> heading -> national.
-# A subheading is NOT a query stage; the national text already carries the
-# 6-digit subheading label + the 7th/8th local label together.
+# build_embeddings.own_description). Stages: chapter -> heading -> subheading.
+# The HST corpus stops at HS6, so the subheading IS the leaf/final stage; its
+# own text carries the discriminating 6-digit grouping label + own label.
 N_CHAP = 2   # chapters kept after stage 1 (beam width — drill into the best N)
-N_HEAD = 3   # headings kept after stage 2 (beam width — a generic 'Other ...'
+N_HEAD = 6   # headings kept after stage 2 (beam width — a generic 'Other ...'
              # heading can out-score the right enumerated heading on own-desc, so
-             # keep several; stage 3 KNNs nationals across ALL kept headings and
-             # the strong national match wins. Raise if the right code is pruned.
-K_NAT  = 5   # national codes returned by stage 3 (final KNN k)
+             # keep several; stage 3 KNNs subheadings across ALL kept headings and
+             # the strong leaf match wins. Raise if the right code is pruned.
+             # 6 (not 3): HST's ~1262 headings crowd stage 2 — at 3 the right
+             # heading (e.g. 4202 for a pocket wallet) gets pruned; at 6 it
+             # survives and 4202.31 returns rank #1.
+K_NAT  = 5   # subheading (HS6) codes returned by stage 3 (final KNN k)
 
 # Keep this prompt SHORT. A long, constraint-heavy prompt makes the Thinking
 # model reason without terminating (burns the whole token budget, emits no JSON).
@@ -161,12 +164,13 @@ def _knn_own(con, blob, level: str, k: int, prefixes=None, chapter=None):
 
 def retrieve(embedding_description: str, n_chap: int = N_CHAP,
              n_head: int = N_HEAD, k_nat: int = K_NAT):
-    """Hierarchical drill-down: chapter -> heading -> national, all scored on the
-    `embedding_own` vectors (own text, top parents discarded). No DB writes.
+    """Hierarchical drill-down: chapter -> heading -> subheading, all scored on
+    the `embedding_own` vectors (own text, top parents discarded). No DB writes.
 
-    Stage 1  KNN chapters                       -> keep best n_chap chapter codes
-    Stage 2  KNN headings within those chapters -> keep best n_head heading codes
-    Stage 3  KNN nationals within those headings-> return top k_nat (final answer)
+    Stage 1  KNN chapters                        -> keep best n_chap chapter codes
+    Stage 2  KNN headings within those chapters  -> keep best n_head heading codes
+    Stage 3  KNN subheadings within those heads  -> return top k_nat (final answer,
+             the HS6 leaf)
     """
     con = _connect()
     blob = struct.pack(f"{DIM}f", *embed(embedding_description).tolist())
@@ -198,17 +202,18 @@ def retrieve(embedding_description: str, n_chap: int = N_CHAP,
     if not head_codes:
         print("!! no heading hit"); con.close(); return
 
-    # heading pct_code is "NN.NN"; national codes are "NNNN.XXXX" — strip the dot
-    # so the prefix filter matches the 8-digit nationals under the heading.
+    # heading pct_code is "NNNN" (4-digit, no dot); subheading codes are
+    # "NNNN.XX" — strip the dot so the prefix filter matches the HS6 leaves
+    # under the heading (e.g. heading "4202" -> "4202" matches "420221").
     head_prefixes = [c.replace(".", "") for c in head_codes]
-    # national rows all sit in the heading's chapter — pass it as a legal vec0
+    # subheading rows all sit in the heading's chapter — pass it as a legal vec0
     # pre-filter to shrink the pool before the Python prefix filter.
     nat_chapter = head_codes[0][:2] if len(chap_codes) == 1 else None
 
-    # Stage 3 — nationals within the winning heading(s) = the final answer.
-    nat = _knn_own(con, blob, "national", k_nat,
+    # Stage 3 — subheadings within the winning heading(s) = the final answer.
+    nat = _knn_own(con, blob, "subheading", k_nat,
                    prefixes=head_prefixes, chapter=nat_chapter)
-    print(f"\n-- stage 3: TOP {k_nat} NATIONAL CODES --")
+    print(f"\n-- stage 3: TOP {k_nat} SUBHEADING (HS6) CODES --")
     for code, dist, own in nat:
         full = con.execute(
             "SELECT description_full FROM vec_embeddings WHERE pct_code = ?",

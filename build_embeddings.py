@@ -27,7 +27,9 @@ from pathlib import Path
 import sqlite_vec
 
 HERE = Path(__file__).resolve().parent
-DB = HERE / "pct_corpus.db"
+# Universal embedder: works against any *_corpus.db with a `codes` table.
+# Default points at the US HST corpus; pass --db pct/pct_corpus.db for PCT.
+DB = HERE / "hst" / "hst_corpus.db"
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 DIM = 384
 BATCH = 256
@@ -69,26 +71,29 @@ def own_description(con: sqlite3.Connection) -> dict[str, str]:
 
       - chapter   : segment[0]      (its own title).
       - heading   : segments[1:]    (drop chapter; heading desc + any below).
-      - national  : segments[2:]    (drop chapter + heading; keeps the
-                    subheading-grouping labels that distinguish HS6 — e.g.
-                    'Articles ... carried in the pocket:' vs 'Other:' — PLUS the
-                    leaf's own label. This is the '6-digit sub + 7th/8th local
-                    classified together' text.)
-      - subheading: not a query stage — skipped.
+      - national  : segments[2:]    (PCT 8-digit leaf — drop chapter + heading;
+                    keeps the subheading-grouping labels that distinguish HS6 —
+                    e.g. 'Articles ... carried in the pocket:' vs 'Other:' — PLUS
+                    the leaf's own label.)
+      - subheading: segments[2:]    (HST HS6 leaf — same cut as national; this is
+                    the leaf the HST cascade ends on.)
 
     Slicing description_full (not re-joining raws) is what preserves the
     discriminating grouping label, which lives only in the chain, never in the
     subheading's description_raw.
 
-    Returns {pct_code: own_text} for chapter/heading/national rows only.
+    Returns {pct_code: own_text} for chapter/heading/leaf (national|subheading)
+    rows.
     """
-    cut = {"chapter": 0, "heading": 1, "national": 2}
+    # national (PCT 8-digit leaf) and subheading (HST HS6 leaf) both cut=2:
+    # drop chapter+heading, keep the discriminating grouping labels + own label.
+    cut = {"chapter": 0, "heading": 1, "national": 2, "subheading": 2}
     out: dict[str, str] = {}
     for code, level, dfull in con.execute(
         "SELECT pct_code, level, description_full FROM codes"
     ):
         if level not in cut or not dfull:
-            continue  # subheading rows skipped on purpose
+            continue
         segs = dfull.split(" > ")
         text = " > ".join(segs[cut[level]:]).strip()
         if text:

@@ -30,7 +30,7 @@ MODEL = "qwen3-vl"
 DEFAULT_IMG = "test.jpeg"
 
 # Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
-DB = Path(__file__).resolve().parent / "pct" / "pct_corpus.db"
+DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DIM = 384
 TOP_K = 8
@@ -108,15 +108,15 @@ def embed(text: str):
     )[0]
 
 
-def retrieve(embedding_description: str, k: int = TOP_K, level: str = "national"):
+def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading"):
     """KNN the embedding_description against vec_embeddings; print top-k with
     full ancestor-chain descriptions. No DB writes.
 
     Filtering on `level` is a metadata pre-filter applied INSIDE the vec0 MATCH,
-    so the k results are all of that level (default 'national' = the real 8-digit
-    tariff lines, not broad chapter/heading rows). Pre-filtering does not change
-    any cosine score — it just curates the candidate pool. Pass level=None to
-    search all levels.
+    so the k results are all of that level (default 'subheading' = the HS6 leaf
+    rows of the HST corpus, not broad chapter/heading rows). Pre-filtering does
+    not change any cosine score — it just curates the candidate pool. Pass
+    level=None to search all levels.
     """
     con = sqlite3.connect(DB)
     con.enable_load_extension(True)
