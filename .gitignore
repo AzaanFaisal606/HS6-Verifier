@@ -1,0 +1,19 @@
+# Claude tooling (never commit into project repos)
+.claude/
+CLAUDE.md
+.superpowers/
+.worktrees/
+
+# runtime / large artifacts
+__pycache__/
+*.pyc
+vllm.log
+hst/hts_cache/
+hst/hst_corpus.db
+pct/pct_corpus.db
+pct_corpus.db
+images/
+
+# source binaries (large, regenerable / external)
+*.pdf
+file
