@@ -64,6 +64,40 @@ def test_no_national_rows():
     assert all(len(r["pct_code"].replace(".", "")) <= 6 for r in rows)
 
 
+def test_single_line_heading_creates_heading_row():
+    # 0205000000 in the h2 tag — should still produce heading row "0205".
+    rows = B.parse_chapter(F.CH02_HTML)
+    d = by_code(rows)
+    assert "0205" in d, "heading 0205 must exist; single-line h2 with 10-digit code was dropped"
+    assert d["0205"]["level"] == "heading"
+    assert d["0205"]["parent_code"] == "02"
+
+
+def test_single_line_heading_hs6_parented_correctly():
+    # 0205.00 must be a subheading under 0205, not under 0204.
+    rows = B.parse_chapter(F.CH02_HTML)
+    d = by_code(rows)
+    assert "0205.00" in d, "0205.00 subheading must exist"
+    assert d["0205.00"]["level"] == "subheading"
+    assert d["0205.00"]["parent_code"] == "0205", (
+        f"0205.00 parent must be 0205, got {d['0205.00']['parent_code']!r}"
+    )
+
+
+def test_single_line_heading_no_wrong_ancestry():
+    # 0205.00 must NOT inherit 0204 "sheep or goats" ancestry.
+    rows = B.parse_chapter(F.CH02_HTML)
+    d = by_code(rows)
+    assert "0205.00" in d
+    full = d["0205.00"]["description_full"]
+    assert "sheep" not in full.lower(), (
+        f"0205.00 description_full must not contain 'sheep'; got: {full!r}"
+    )
+    assert "Meat of horses" in full or "horses" in full.lower(), (
+        f"0205.00 must contain horse-meat text; got: {full!r}"
+    )
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for fn in fns:

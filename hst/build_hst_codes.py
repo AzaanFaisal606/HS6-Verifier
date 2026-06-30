@@ -25,9 +25,11 @@ _CH_RE = re.compile(
     r"(?:<!--\s*-->)?\s*(.*?)</h1>",
     re.S,
 )
-# <h2 class="subheading">DDDD<!-- -->: <!-- -->NAME</h2>
+# <h2 class="subheading">DDDD[DDDDDD]<!-- -->: <!-- -->NAME</h2>
+# Single-line headings render the full 10-digit code in the h2; capture only
+# the first 4 digits as the heading code and discard the rest before the colon.
 _HEAD_RE = re.compile(
-    r'<h2 class="subheading">\s*(\d{4})\s*(?:<!--\s*-->)?:\s*'
+    r'<h2 class="subheading">\s*(\d{4})\d*\s*(?:<!--\s*-->)?:\s*'
     r"(?:<!--\s*-->)?\s*(.*?)</h2>",
     re.S,
 )

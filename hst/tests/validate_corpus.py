@@ -57,10 +57,39 @@ def main() -> int:
     if "Cattle" not in (full("0102.21") or ""):
         fails.append("Cattle label missing from 0102.21 full desc")
 
+    # every heading's parent must be exactly the chapter (first 2 digits of pct_code)
+    bad_h_prefix = q(
+        "select count(*) from codes where level='heading' "
+        "and parent_code != substr(pct_code, 1, 2)"
+    ).fetchone()[0]
+    if bad_h_prefix:
+        fails.append(
+            f"{bad_h_prefix} headings whose parent_code != first-2-digits of pct_code"
+        )
+
+    # every subheading's parent must be exactly the first 4 digits of pct_code
+    # (i.e. the correct heading, not just any heading that happens to exist)
+    bad_s_prefix = q(
+        "select count(*) from codes where level='subheading' "
+        "and parent_code != substr(replace(pct_code, '.', ''), 1, 4)"
+    ).fetchone()[0]
+    if bad_s_prefix:
+        fails.append(
+            f"{bad_s_prefix} subheadings whose parent_code != first-4-digits of stripped pct_code"
+        )
+
     counts = dict(
         q("select level, count(*) from codes group by level").fetchall()
     )
     print("level counts:", counts)
+
+    # heading count sanity band: HTS has ~1262 headings; 961 (pre-fix count) must fail
+    heading_count = counts.get("heading", 0)
+    if heading_count < 1100:
+        fails.append(
+            f"heading count {heading_count} < 1100 (expected ~1262; likely missing single-line headings)"
+        )
+
     if fails:
         print("FAIL:")
         for f in fails:
