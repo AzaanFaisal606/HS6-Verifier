@@ -30,7 +30,7 @@ MODEL = "qwen3-vl"
 DEFAULT_IMG = "test.jpeg"
 
 # Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
-DB = Path(__file__).resolve().parent / "pct_corpus.db"
+DB = Path(__file__).resolve().parent / "pct" / "pct_corpus.db"
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 DIM = 384
 TOP_K = 8

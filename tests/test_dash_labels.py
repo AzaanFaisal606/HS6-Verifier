@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # repo root for build_codes
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pct"))  # pct/ for build_codes
 sys.path.insert(0, str(Path(__file__).resolve().parent))          # tests dir for fixtures
 import build_codes
 import fixtures as F
