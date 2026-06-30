@@ -95,10 +95,10 @@ the scripts, and the chapter docs:
 
 ```bash
 DST="/home/azaan/Documents/PTC Corpus/remote-gpu"
-cp "/home/azaan/Documents/PTC Corpus/pct_corpus.db"        "$DST"/
-cp "/home/azaan/Documents/PTC Corpus/build_embeddings.py"  "$DST"/
-cp "/home/azaan/Documents/PTC Corpus/vlm_infer.py"         "$DST"/   # the VLM script
-cp -r "/home/azaan/Documents/PTC Corpus/docs"              "$DST"/
+cp "/home/azaan/Documents/PTC Corpus/pct/pct_corpus.db"        "$DST"/
+cp "/home/azaan/Documents/PTC Corpus/pct/build_embeddings.py"  "$DST"/
+cp "/home/azaan/Documents/PTC Corpus/vlm_infer.py"             "$DST"/   # the VLM script
+cp -r "/home/azaan/Documents/PTC Corpus/docs"                  "$DST"/
 ```
 
 (Or, faster for large/again-and-again syncs, rsync directly over ssh — bypasses
@@ -106,7 +106,7 @@ the FUSE layer:)
 
 ```bash
 rsync -avP -e "ssh -p PORT" \
-  "/home/azaan/Documents/PTC Corpus/pct_corpus.db" \
+  "/home/azaan/Documents/PTC Corpus/pct/pct_corpus.db" \
   "/home/azaan/Documents/PTC Corpus/vlm_infer.py" \
   USER@HOST:REMOTE_DIR/
 ```

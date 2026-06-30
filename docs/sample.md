@@ -1,6 +1,6 @@
 # Sample `codes` Rows
 
-Representative entries from `pct_corpus.db` (table `codes`), chosen to show every
+Representative entries from `pct/pct_corpus.db` (table `codes`), chosen to show every
 `level`, the parent chain, and the tricky parsing cases. Full untruncated values.
 
 ## Full ancestor chain — one national line walked up to its chapter (Live bovine animals → Bulls)

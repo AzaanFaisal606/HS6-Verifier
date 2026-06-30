@@ -36,7 +36,7 @@ the two columns of digits into a single interleaved stream.
   recover the true two-column rate layout.
 - Or hand-correct the 6 values against the published FBR tariff PDF.
 
-**Detection query:**
+**Detection query (run against `pct/pct_corpus.db`):**
 ```sql
 SELECT pct_code, description_raw, cd_percent
 FROM codes
@@ -53,7 +53,7 @@ it appears only via its leaf rows (`1103.1100`, `1103.1300`, `1103.1900`,
 intact, but the PDF gives it no title text.
 
 **Resolution:** backfilled with the WCO title via `HEADING_TITLE_OVERRIDES` in
-`build_codes.py`. The synthesizer now stamps any title-less synthetic heading
+`pct/build_codes.py`. The synthesizer now stamps any title-less synthetic heading
 from that map.
 
 | pct_code | level | parent_code | description_raw | is_synthetic |
@@ -76,7 +76,7 @@ WHERE level = 'heading' AND (description_raw = '' OR description_raw IS NULL);
 
 When a 6-digit subheading's national leaves diverge into different branches with
 no single shared label (e.g. `8544.30`: leaves under "Of a kind used in vehicles
-of ch87:" AND under "Other"), `subheading_labels` in `build_codes.py` sets the
+of ch87:" AND under "Other"), `subheading_labels` in `pct/build_codes.py` sets the
 subheading's `description_raw = ""` — there is no one label that names the whole
 subheading. ~987 of 5403 subheadings are affected.
 
@@ -90,7 +90,7 @@ subheading rows (subheading is not a stage), so empty subheading raws don't hurt
 retrieval. Any future code that keys on subheading `description_raw` must handle
 the empty case (fall back to `description_full` or the children's labels).
 
-**Detection query:**
+**Detection query (run against `pct/pct_corpus.db`):**
 ```sql
 SELECT COUNT(*) FROM codes WHERE level='subheading'
 AND (description_raw='' OR description_raw IS NULL);   -- ~987
