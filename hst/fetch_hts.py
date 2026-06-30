@@ -159,8 +159,9 @@ def main() -> int:
             print(f"ch {ch}: {status}")
         except Exception as e:  # noqa: BLE001 - report and continue
             print(f"ch {ch}: ERROR {e}")
+            status = "error"
             rc = 1
-        if status != "cached":  # type: ignore[name-defined]
+        if status != "cached":
             time.sleep(DELAY_S)
     return rc
 
