@@ -54,6 +54,7 @@ def test_grouping_label_in_full_desc():
         "Live animals > Live bovine animals"
     )
     assert all("Cattle" != r["pct_code"] for r in rows)
+    assert "Cattle" not in d["0102.29"]["description_full"]
 
 
 def test_no_national_rows():

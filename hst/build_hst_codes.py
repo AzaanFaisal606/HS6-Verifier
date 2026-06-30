@@ -126,3 +126,102 @@ def parse_chapter(html: str) -> list[dict]:
             labels = []  # flat attach: clear buffer after each emitted HS6
 
     return rows
+
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS codes (
+    pct_code         TEXT PRIMARY KEY,
+    level            TEXT,
+    parent_code      TEXT,
+    description_raw  TEXT,
+    description_full TEXT,
+    cd_percent       TEXT,
+    fiscal_year      TEXT,
+    is_synthetic     BOOLEAN
+)
+"""
+
+
+def build_db(rows: list[dict], db_path: Path) -> None:
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_SCHEMA)
+        con.executemany(
+            "INSERT OR REPLACE INTO codes "
+            "(pct_code, level, parent_code, description_raw, description_full, "
+            " cd_percent, fiscal_year, is_synthetic) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            [
+                (
+                    r["pct_code"],
+                    r["level"],
+                    r["parent_code"],
+                    r["description_raw"],
+                    r["description_full"],
+                    None,  # cd_percent deferred
+                    FISCAL_YEAR,
+                    1 if r["is_synthetic"] else 0,
+                )
+                for r in rows
+            ],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def summarize(ch: str, rows: list[dict]) -> str:
+    chap = [r for r in rows if r["level"] == "chapter"]
+    heads = [r for r in rows if r["level"] == "heading"]
+    subs = [r for r in rows if r["level"] == "subheading"]
+    synth = sum(1 for r in subs if r["is_synthetic"])
+    name = chap[0]["description_raw"] if chap else "?"
+    warns = []
+    if not subs:
+        warns.append("NO-SUBHEADINGS")
+    head_codes = {h["pct_code"] for h in heads}
+    parented = {s["parent_code"] for s in subs}
+    for hc in head_codes - parented:
+        warns.append(f"empty-heading:{hc}")
+    for s in subs:
+        if not s["description_raw"] and SEP not in s["description_full"].split(
+            SEP, 2
+        )[-1]:
+            warns.append(f"bare-hs6:{s['pct_code']}")
+    w = ("  [" + ", ".join(warns) + "]") if warns else ""
+    return (
+        f"ch {ch}  {name[:40]:<40}  headings={len(heads)} "
+        f"subheadings={len(subs)} (synth={synth}){w}"
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--chapters", help="comma list e.g. 01,42,85")
+    args = ap.parse_args()
+
+    files = sorted(CACHE.glob("*.html"))
+    if args.chapters:
+        want = {c.strip().zfill(2) for c in args.chapters.split(",")}
+        files = [f for f in files if f.stem in want]
+    if not files:
+        print("no cached HTML found - run fetch_hts.py first")
+        return 1
+
+    all_rows: list[dict] = []
+    for f in files:
+        try:
+            rows = parse_chapter(f.read_text())
+        except Exception as e:  # noqa: BLE001
+            print(f"ch {f.stem}: PARSE-ERROR {e}")
+            continue
+        print(summarize(f.stem, rows))
+        all_rows.extend(rows)
+
+    build_db(all_rows, DB)
+    print(f"\nwrote {len(all_rows)} rows to {DB.name}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
