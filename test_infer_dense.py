@@ -31,8 +31,16 @@ DEFAULT_IMG = "test.jpeg"
 
 # Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
 DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-DIM = 384
+EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+DIM = 1024
+# CPU embedder: coexists with the ~11GB vLLM server on one 12GB GPU (GPU would OOM).
+EMBED_DEVICE = "cpu"
+# Qwen3-Embedding asymmetric: query gets the instruction, corpus is raw.
+# Must match build_embeddings.QUERY_INSTRUCT.
+QUERY_INSTRUCT = (
+    "Instruct: Given a product description, retrieve the matching "
+    "Harmonized System (HS) tariff classification.\nQuery: "
+)
 
 # --- Hierarchical (dense-emb) cascade knobs -------------------------------
 # Query drills down one HS level at a time against the `embedding_own` vectors
@@ -53,21 +61,23 @@ K_NAT  = 5   # subheading (HS6) codes returned by stage 3 (final KNN k)
 # Keep this prompt SHORT. A long, constraint-heavy prompt makes the Thinking
 # model reason without terminating (burns the whole token budget, emits no JSON).
 # A terse "look, brief reason, output JSON" reliably finishes (finish=stop).
-PROMPT = """You extract product attributes for customs tariff (HS) classification. Think
-in 3 short sentences max, then output JSON. Do not exceed that — brevity is required.
+# Think in 3 short sentences max, then output JSON. Do not exceed that — brevity is required.
 
+PROMPT = """You extract product attributes for customs tariff (HS) classification.
 RULES:
 - Describe ONLY the product. NEVER mention background, surface it rests on,
   lighting, or photo setting.
 - State what the object IS (its common article name: e.g. wallet, purse,
-  belt, key-case) and HOW/WHERE a person carries or uses it (pocket, handbag,
-  worn, desk) — these carry/use facts are critical for classification.
+  belt, key-case).
+- If the item is held on person, then HOW/WHERE a person carries or uses it (pocket, handbag,
+  worn, desk).
 - Report only visually-verifiable construction and material. Do NOT guess
   fiber content, hide/skin species, or genuine-vs-synthetic — put those in
   uncertain_attributes.
 - embedding_description must be ONE tariff-style sentence that leads with the
-  article name and its carry/use context, then outer-surface material, then
+  article name and its carry/use context (if needed), then outer-surface material, then
   construction. No colours-only, no scene, no filler.
+- Use tarrif terminology for categorizing the product.
 
 Output ONLY this JSON (nothing after):
 {
@@ -75,7 +85,7 @@ Output ONLY this JSON (nothing after):
   "function": "<how/where carried or used>",
   "visible_construction": "<stitching/closure/fold — only if evident>",
   "visible_materials": ["<outer surface material as it appears>"],
-  "embedding_description": "<article name + carry/use context + outer-surface
+  "embedding_description": "<article name + carry/use context (if needed) + outer-surface
      material + construction, one sentence, tariff register>",
   "uncertain_attributes": ["<attr>: <why not determinable from image>"],
   "confidence_notes": "<brief>"
@@ -113,13 +123,14 @@ _embed_model = None
 
 
 def embed(text: str):
-    """Embed one string with the corpus model (L2-normalized, cosine-ready)."""
+    """Embed one QUERY string (Qwen3-Embedding instruction-wrapped, CPU)."""
     global _embed_model
     if _embed_model is None:
         from sentence_transformers import SentenceTransformer
-        _embed_model = SentenceTransformer(EMBED_MODEL)
+        _embed_model = SentenceTransformer(EMBED_MODEL, device=EMBED_DEVICE)
     return _embed_model.encode(
-        [text], normalize_embeddings=True, convert_to_numpy=True
+        [f"{QUERY_INSTRUCT}{text}"], normalize_embeddings=True,
+        convert_to_numpy=True,
     )[0]
 
 
@@ -237,7 +248,7 @@ def main():
                 {"type": "text", "text": PROMPT},
             ],
         }],
-        max_tokens=2100,
+        max_tokens=14000,
         temperature=0.3,
     )
     msg = resp.choices[0].message

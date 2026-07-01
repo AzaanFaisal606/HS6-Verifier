@@ -95,12 +95,19 @@ def parse_chapter(html: str) -> list[dict]:
         end = heads[i + 1].start() if i + 1 < len(heads) else len(html)
         section = html[start:end]
 
-        labels: list[str] = []
+        # One grouping label governs every following HS6 until the next label
+        # row appears (no label nesting occurs at the HS6 level — verified across
+        # the corpus: zero back-to-back label rows). A new label REPLACES the
+        # active group; emitting an HS6 does NOT clear it, so sibling HS6 sharing
+        # one colSpan label (e.g. 4202.11 / 4202.12 under "Trunks, suitcases ...
+        # school satchels and similar containers") all inherit it. The buffer is
+        # re-init'd per heading section, so labels never leak across headings.
+        group_label: str | None = None
         seen6: set[str] = set()
         for chunk in _TR_SPLIT.split(section):
             lm = _LABEL_RE.search(chunk)
             if lm:
-                labels.append(_clean(lm.group(1)))
+                group_label = _clean(lm.group(1))
                 continue
             idm = _ID_RE.search(chunk)
             if not idm:
@@ -114,7 +121,11 @@ def parse_chapter(html: str) -> list[dict]:
             seen6.add(six)
             nm = _NAME_RE.search(chunk)
             raw = _clean(nm.group(1)) if nm else ""
-            full_parts = [ch_name, head_name] + labels + ([raw] if raw else [])
+            full_parts = (
+                [ch_name, head_name]
+                + ([group_label] if group_label else [])
+                + ([raw] if raw else [])
+            )
             rows.append(
                 dict(
                     pct_code=six,
@@ -125,7 +136,6 @@ def parse_chapter(html: str) -> list[dict]:
                     is_synthetic=digits[:6] not in bare6,
                 )
             )
-            labels = []  # flat attach: clear buffer after each emitted HS6
 
     return rows
 
