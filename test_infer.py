@@ -15,60 +15,38 @@ MODEL = "qwen3-vl"
 
 DEFAULT_IMG = "test.jpeg"
 
-# Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
 DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 DIM = 1024
-# Retrieve a WIDE cosine pool (TOP_K) but only DISPLAY the best few (SHOW_N).
-# The full pool is fed to the reranker, which then re-orders it. K is wide on
-# purpose: cosine smears material/negation (e.g. "not leather" ~0.84 to
-# "leather"), so the true code can sit deep in the pool — the reranker promotes
-# it, but only if it's IN the pool. Don't shrink K without reason.
 TOP_K = 50
 SHOW_N = 5
-# Embedder runs on CPU: this client coexists with the ~11GB vLLM server on the
-# same 12GB GPU, so a GPU embedder would OOM. 0.6B on CPU for one query is ~1-2s.
 EMBED_DEVICE = "cpu"
-# Qwen3-Embedding is asymmetric — the QUERY gets a task instruction, the corpus
-# (built in build_embeddings.py) is raw. Must match build_embeddings.QUERY_INSTRUCT.
 QUERY_INSTRUCT = (
     "Instruct: Given a product description, retrieve the matching "
     "Harmonized System (HS) tariff classification.\nQuery: "
 )
 
-# Qwen3-Reranker is an LLM judge (Qwen3ForCausalLM + a yes/no logit head): for a
-# (query, document) pair it scores P("yes") that the document answers the query.
-# It needs a TASK INSTRUCTION describing what to judge — without it the model
-# behaves like a dumb similarity scorer (it will keep "leather" on top for a
-# "not leather" query). The instruction is deliberately GENERIC (no mention of
-# material) so it generalizes past the material-negation case we first tested.
 RERANK_INSTRUCT = (
     "Given a product description, decide if the candidate tariff (HS) "
     "classification describes the product."
 )
-# Reranker on CPU for the same reason as the embedder: coexists with the ~11GB
-# vLLM server on a 12GB GPU. ~50 pair-forwards for one query is a couple seconds.
 RERANK_DEVICE = "cpu"
 
-# Keep this prompt SHORT. A long, constraint-heavy prompt makes the Thinking
-# model reason without terminating (burns the whole token budget, emits no JSON).
-# A terse "look, brief reason, output JSON" reliably finishes (finish=stop).
-# Think in 3 short sentences max, then output JSON. Do not exceed that — brevity is required.
-
-PROMPT = """You extract product attributes for customs tariff (HS) classification.
+PROMPT = """You extract product attributes for customs tariff (HS) classification for US imports. We are using the HST schedule for codes and descriptions.
 RULES:
 - Describe ONLY the product. NEVER mention background, surface it rests on,
   lighting, or photo setting.
 - State what the object IS (its common article name: e.g. wallet, purse,
   belt, key-case).
-- If the item is held on person, then HOW/WHERE a person carries or uses it (pocket, handbag,
+- HOW it is used / HOW it functions.
+- If the item is held on person, then WHERE a person carries or uses it (pocket, handbag,
   worn, desk).
 - Report only visually-verifiable construction and material. Do NOT guess
   fiber content, hide/skin species, or genuine-vs-synthetic — put those in
   uncertain_attributes.
 - embedding_description must be ONE tariff-style sentence that leads with the
-  article name and its carry/use context (if needed), then outer-surface material, then
+  article name and its carry/use context, then outer-surface material, then
   construction. No colours-only, no scene, no filler.
 - Use tarrif terminology for categorizing the product.
 
@@ -78,7 +56,7 @@ Output ONLY this JSON (nothing after):
   "function": "<how/where carried or used>",
   "visible_construction": "<stitching/closure/fold — only if evident>",
   "visible_materials": ["<outer surface material as it appears>"],
-  "embedding_description": "<article name + carry/use context (if needed) + outer-surface
+  "embedding_description": "<article name + carry/use context + outer-surface
      material + construction, one sentence, tariff register>",
   "uncertain_attributes": ["<attr>: <why not determinable from image>"],
   "confidence_notes": "<brief>"
@@ -95,7 +73,6 @@ def to_image_url(src: str) -> str:
 
 
 def extract_json(text: str) -> str:
-    """Pull the last balanced {...} object out of a text blob."""
     if not text:
         return text
     end = text.rfind("}")
@@ -116,12 +93,6 @@ _embed_model = None
 
 
 def embed(text: str):
-    """Embed one QUERY string with the corpus model (L2-normalized, cosine-ready).
-
-    The text is wrapped with the Qwen3-Embedding task instruction (query side);
-    the corpus was embedded raw. Runs on CPU (EMBED_DEVICE) to avoid OOM next to
-    the vLLM server.
-    """
     global _embed_model
     if _embed_model is None:
         from sentence_transformers import SentenceTransformer
@@ -133,18 +104,6 @@ def embed(text: str):
 
 
 def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading"):
-    """KNN the embedding_description against vec_embeddings; print the best
-    SHOW_N for readability and RETURN all k candidates for reranking. No writes.
-
-    Filtering on `level` is a metadata pre-filter applied INSIDE the vec0 MATCH,
-    so the k results are all of that level (default 'subheading' = the HS6 leaf
-    rows of the HST corpus, not broad chapter/heading rows). Pre-filtering does
-    not change any cosine score — it just curates the candidate pool. Pass
-    level=None to search all levels.
-
-    Returns: list of (pct_code, level, distance, description_full), best-first,
-    length k. Only the top SHOW_N are printed; the rest go to the reranker.
-    """
     con = sqlite3.connect(DB)
     con.enable_load_extension(True)
     sqlite_vec.load(con)
@@ -167,27 +126,102 @@ def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheadin
           f"{tag}\n{'='*72}")
     print(f"query: {embedding_description!r}\n")
     for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
-        # vec0 cosine distance -> similarity = 1 - distance
         print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
         print(f"            {desc_full}\n")
     return rows
+
+
+REINFER_CHAPTERS = 2
+
+REINFER_PROMPT = """You previously described this product for customs tariff (HS)
+classification. Below are REAL tariff descriptions retrieved from the HS
+schedule. They are shown ONLY as examples of how tariff text is phrased
+(register, word order, terminology) — they are NOT necessarily the correct
+classification for THIS product and may describe entirely different goods.
+
+SAMPLE TARIFF DESCRIPTIONS (style reference only):
+{samples}
+
+Your previous description of the product was:
+"{prev_desc}"
+
+TASK: Look at the image again and write ONE new tariff-style sentence describing
+the ACTUAL product you see.
+RULES:
+- Match the STYLE of the samples (formal tariff register, article-name-first,
+  terminology) — do NOT copy their wording, article names, materials, or
+  classification.
+- Describe the product in the image, NOT any of the sample products. If none of
+  the samples match the product, ignore their content and describe what you see.
+- Lead with the article name + carry/use context, then outer-surface material,
+  then construction.
+- Do not invent material/species you cannot see.
+
+Output ONLY this JSON (nothing after):
+{{
+  "embedding_description": "<one tariff-style sentence describing the product>"
+}}"""
+
+
+def reinfer(image_url: str, prev_desc: str, candidates: list,
+            n_chapters: int = REINFER_CHAPTERS):
+    if not candidates:
+        print("\n!! reinfer: no candidates — keeping previous description")
+        return prev_desc
+
+    samples = []
+    seen_chapters = set()
+    for pct_code, lvl, dist, desc_full in candidates:
+        chapter = str(pct_code)[:2]
+        if chapter in seen_chapters:
+            continue
+        seen_chapters.add(chapter)
+        samples.append((pct_code, desc_full))
+        if len(samples) >= n_chapters:
+            break
+
+    samples_block = "\n".join(f"- {desc}" for _, desc in samples)
+    prompt = REINFER_PROMPT.format(samples=samples_block, prev_desc=prev_desc)
+
+    print(f"\n{'='*72}\nREINFER: {len(samples)} distinct-chapter style sample(s)"
+          f"\n{'='*72}")
+    for pct_code, desc in samples:
+        print(f"  [{str(pct_code)[:2]}] {pct_code}: {desc}")
+
+    resp = client.chat.completions.create(
+        model=MODEL,
+        messages=[{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        max_tokens=14000,
+        temperature=0.3,
+    )
+    msg = resp.choices[0].message
+    content = (msg.content or "").strip()
+    try:
+        new_desc = (json.loads(extract_json(content)).get(
+            "embedding_description") or "").strip()
+    except json.JSONDecodeError as e:
+        print(f"!! reinfer JSON parse failed: {e} — keeping previous description")
+        return prev_desc
+
+    if not new_desc:
+        print("!! reinfer produced no embedding_description — keeping previous")
+        return prev_desc
+
+    print(f"\nprev: {prev_desc!r}")
+    print(f"new : {new_desc!r}")
+    return new_desc
 
 
 _rerank_model = None
 
 
 def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
-    """Re-order cosine `candidates` with Qwen3-Reranker-0.6B and print the top
-    `show_n`. `candidates` is what retrieve() returns:
-    (pct_code, level, distance, description_full) tuples.
-
-    The reranker is a cross-encoder LLM: it reads (query, document) TOGETHER, so
-    unlike the bi-encoder it can attend "not leather" -> "leather" and push the
-    wrong material DOWN. The document is the candidate's description_full (the
-    same text cosine ranked on). RERANK_INSTRUCT tells it what to judge.
-
-    Returns: list of (score, pct_code, level, description_full), best-first.
-    """
     global _rerank_model
     if not candidates:
         print("\n!! no candidates to rerank")
@@ -196,11 +230,10 @@ def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
         import torch
         from sentence_transformers import CrossEncoder
         if RERANK_DEVICE == "cpu":
-            # same WSL2 spike guard as the embedder: don't pin every core.
             torch.set_num_threads(max(1, (torch.get_num_threads() or 4) // 2))
         _rerank_model = CrossEncoder(RERANK_MODEL, device=RERANK_DEVICE)
 
-    docs = [c[3] for c in candidates]  # description_full per candidate
+    docs = [c[3] for c in candidates]
     pairs = [(embedding_description, d) for d in docs]
     scores = _rerank_model.predict(pairs, prompt=RERANK_INSTRUCT)
 
@@ -220,13 +253,14 @@ def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
 
 def main():
     image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+    image_url = to_image_url(image)
 
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": to_image_url(image)}},
+                {"type": "image_url", "image_url": {"url": image_url}},
                 {"type": "text", "text": PROMPT},
             ],
         }],
@@ -253,11 +287,13 @@ def main():
         return
     print(json.dumps(parsed, indent=2))
 
-    # embed the embedding_description, retrieve a wide cosine pool, then rerank.
     desc = (parsed.get("embedding_description") or "").strip()
     if desc:
         candidates = retrieve(desc)
-        rerank(desc, candidates)
+        new_desc = reinfer(image_url, desc, candidates)
+        if new_desc != desc:
+            candidates = retrieve(new_desc)
+        rerank(new_desc, candidates)
     else:
         print("\n!! no embedding_description in output — skipping retrieval")
 
