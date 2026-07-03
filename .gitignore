@@ -10,10 +10,13 @@ docs/
 # runtime / large artifacts
 __pycache__/
 *.pyc
-vllm.log
+*.log
 hst/hts_cache/
 hst/hst_corpus.db
 images/
+
+# NVFP4 / 27B experiment scaffolding (external, non-runnable on this box)
+nvfp4/
 
 # source binaries (large, regenerable / external)
 *.pdf

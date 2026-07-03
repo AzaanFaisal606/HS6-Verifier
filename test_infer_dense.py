@@ -1,17 +1,24 @@
-"""Single-call VLM product extraction for tariff classification.
+"""Chapter-gated VLM product classification for tariff (HS) codes.
 
-One request: the model looks at the image, reasons briefly about the product,
-and emits a JSON object matching the schema. Output (any reasoning + the JSON)
-is printed and the JSON is parsed/validated.
+Two classification stages, ONE model call:
 
-Why single-call (not a 2-phase analyze->structure split): this is the Qwen3-VL
-*Thinking* variant. On a constrained text-only "structure this" step it reasons
-without terminating and burns the whole token budget before emitting JSON. But
-image -> brief reasoning -> JSON in ONE call terminates cleanly (finish=stop)
-and fits the 3072-token window with room to spare. So we keep it to one call.
+  Stage A (in the single VLM call): the model is given the FULL catalog of HS
+  chapter titles and, alongside the usual product attributes, emits the top-3
+  chapters it thinks the product belongs to.
+  Stage B (retrieval): flat KNN on `embedding` (description_full), pre-filtered
+  to level='subheading' AND restricted to the chapters the model chose, then
+  reranked with the cross-encoder. This is the same retrieve -> rerank pipeline
+  as test_infer.py — the only difference is the chapter gate replaces the wide
+  all-chapter pool (and there is no reinfer step here).
+
+Why chapter-gate instead of the old level-by-level cascade: the previous dense
+strategy drilled chapter->heading->subheading on `embedding_own`, and a wrong
+prune at any stage was unrecoverable. Here the model picks the chapter set up
+front (it is good at coarse "what kind of thing is this"), and the leaf pool
+inside those chapters stays wholly alive for the reranker.
 
 Usage:
-    python test_infer.py [image_path_or_url]
+    python test_infer_dense.py [image_path_or_url]
 """
 import base64
 import json
@@ -32,64 +39,66 @@ DEFAULT_IMG = "test.jpeg"
 # Corpus retrieval — must match build_embeddings.py (same model/dim/metric).
 DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
+RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 DIM = 1024
-# CPU embedder: coexists with the ~11GB vLLM server on one 12GB GPU (GPU would OOM).
+TOP_K = 50          # cosine pool size handed to the reranker (across the gate)
+SHOW_N = 5
+N_CHAPTERS = 3      # how many chapters the model outputs / we gate retrieval to
+# CPU embedder/reranker: coexist with the ~11GB vLLM server on one 12GB GPU.
 EMBED_DEVICE = "cpu"
+RERANK_DEVICE = "cpu"
 # Qwen3-Embedding asymmetric: query gets the instruction, corpus is raw.
 # Must match build_embeddings.QUERY_INSTRUCT.
 QUERY_INSTRUCT = (
     "Instruct: Given a product description, retrieve the matching "
     "Harmonized System (HS) tariff classification.\nQuery: "
 )
+RERANK_INSTRUCT = (
+    "Given a product description, decide if the candidate tariff (HS) "
+    "classification describes the product."
+)
 
-# --- Hierarchical (dense-emb) cascade knobs -------------------------------
-# Query drills down one HS level at a time against the `embedding_own` vectors
-# (each row embedded on its OWN text, top parents discarded — see
-# build_embeddings.own_description). Stages: chapter -> heading -> subheading.
-# The HST corpus stops at HS6, so the subheading IS the leaf/final stage; its
-# own text carries the discriminating 6-digit grouping label + own label.
-N_CHAP = 2   # chapters kept after stage 1 (beam width — drill into the best N)
-N_HEAD = 6   # headings kept after stage 2 (beam width — a generic 'Other ...'
-             # heading can out-score the right enumerated heading on own-desc, so
-             # keep several; stage 3 KNNs subheadings across ALL kept headings and
-             # the strong leaf match wins. Raise if the right code is pruned.
-             # 6 (not 3): HST's ~1262 headings crowd stage 2 — at 3 the right
-             # heading (e.g. 4202 for a pocket wallet) gets pruned; at 6 it
-             # survives and 4202.31 returns rank #1.
-K_NAT  = 5   # subheading (HS6) codes returned by stage 3 (final KNN k)
+# Prompt carries the full chapter catalog ({chapter_catalog}) so the model can
+# choose from the SAME chapters that exist in the corpus. JSON braces are doubled
+# for str.format.
+PROMPT = """You extract product attributes for customs tariff (HS) classification for US imports. We are using the HST schedule for codes and descriptions.
 
-# Keep this prompt SHORT. A long, constraint-heavy prompt makes the Thinking
-# model reason without terminating (burns the whole token budget, emits no JSON).
-# A terse "look, brief reason, output JSON" reliably finishes (finish=stop).
-# Think in 3 short sentences max, then output JSON. Do not exceed that — brevity is required.
+Here is the full list of HS chapters (2-digit code + title):
+{chapter_catalog}
 
-PROMPT = """You extract product attributes for customs tariff (HS) classification.
 RULES:
 - Describe ONLY the product. NEVER mention background, surface it rests on,
   lighting, or photo setting.
+- State what general category it comes under (e.g. Bovine anime, Data processing machine, Organic chemical).
 - State what the object IS (its common article name: e.g. wallet, purse,
   belt, key-case).
-- If the item is held on person, then HOW/WHERE a person carries or uses it (pocket, handbag,
+- HOW it is used / HOW it functions.
+- If the item is held on person, then WHERE a person carries or uses it (pocket, handbag,
   worn, desk).
 - Report only visually-verifiable construction and material. Do NOT guess
   fiber content, hide/skin species, or genuine-vs-synthetic — put those in
-  uncertain_attributes.
+  uncertain_attributes. Also only report material makeup if the material of the object is relevant to its functionality.
 - embedding_description must be ONE tariff-style sentence that leads with the
-  article name and its carry/use context (if needed), then outer-surface material, then
+  article name and its category, carry/use context, then outer-surface material, then
   construction. No colours-only, no scene, no filler.
 - Use tarrif terminology for categorizing the product.
+- chapters: pick the {n_chapters} chapters from the list above that are MOST
+  likely to contain this product, ordered most-likely first. Output their
+  2-digit codes exactly as shown (e.g. "42"). Choose ONLY from the list.
 
 Output ONLY this JSON (nothing after):
-{
-  "category": "<common article name>",
+{{
+  "name": "<common article name>",  
+  "category": "<general article category>",
   "function": "<how/where carried or used>",
   "visible_construction": "<stitching/closure/fold — only if evident>",
   "visible_materials": ["<outer surface material as it appears>"],
-  "embedding_description": "<article name + carry/use context (if needed) + outer-surface
+  "chapters": ["<2-digit>", "<2-digit>", "<2-digit>"],
+  "embedding_description": "<article name + carry/use context + outer-surface
      material + construction, one sentence, tariff register>",
   "uncertain_attributes": ["<attr>: <why not determinable from image>"],
   "confidence_notes": "<brief>"
-}"""
+}}"""
 
 
 def to_image_url(src: str) -> str:
@@ -119,6 +128,20 @@ def extract_json(text: str) -> str:
     return text
 
 
+def load_chapters():
+    """Return [(code, title)] for every chapter row, ordered by code.
+
+    Plain sqlite (no vec extension needed) — reads the `codes` table.
+    """
+    con = sqlite3.connect(DB)
+    rows = con.execute(
+        "SELECT pct_code, description_raw FROM codes "
+        "WHERE level='chapter' ORDER BY pct_code"
+    ).fetchall()
+    con.close()
+    return rows
+
+
 _embed_model = None
 
 
@@ -134,118 +157,98 @@ def embed(text: str):
     )[0]
 
 
-def _connect():
+def retrieve(embedding_description: str, chapters: list, k: int = TOP_K,
+             level: str = "subheading"):
+    """Flat KNN on `embedding` (description_full), pre-filtered to `level` and
+    GATED to `chapters`.
+
+    vec0 KNN allows only `=`/`!=`/`<`/`>` on metadata — no IN/OR. So we KNN once
+    per chapter with a legal `chapter = ?` filter, merge the pools, and take the
+    globally-nearest k across the gate. Returns (pct_code, level, distance,
+    description_full) 4-tuples — the shape rerank() expects.
+    """
     con = sqlite3.connect(DB)
     con.enable_load_extension(True)
     sqlite_vec.load(con)
     con.enable_load_extension(False)
-    return con
 
+    qvec = embed(embedding_description)
+    blob = struct.pack(f"{DIM}f", *qvec.tolist())
 
-def _knn_own(con, blob, level: str, k: int, prefixes=None, chapter=None):
-    """KNN against the `embedding_own` vectors, restricted to one HS level and
-    (optionally) to descendants of a winning parent.
-
-    vec0 KNN only allows EQUALITY/inequality on metadata columns inside a MATCH
-    query — no LIKE, no OR, no IN. So we can pre-filter cheaply on `level` and
-    `chapter` (both metadata `=`), but a pct_code PREFIX narrowing (e.g. "only
-    nationals under heading 42.02") is NOT expressible in the MATCH. For that we
-    over-fetch a generous KNN and filter the prefixes in Python afterward.
-
-      - chapter  : optional 2-digit, applied as a legal `chapter = ?` pre-filter.
-      - prefixes : optional list of pct_code prefixes (e.g. ['4202']); applied in
-                   Python post-KNN. We over-fetch (k * fanout) so enough in-prefix
-                   rows survive the filter before we slice to k.
-
-    Returns rows (pct_code, distance, description_own) ordered by distance.
-    """
-    fetch = k if prefixes is None else max(k * 40, 200)  # over-fetch for py filter
-    sql = ("SELECT pct_code, distance, description_own "
-           "FROM vec_embeddings WHERE embedding_own MATCH ? AND k = ? AND level = ?")
-    params = [blob, fetch, level]
-    if chapter is not None:
-        sql += " AND chapter = ?"
-        params.append(chapter)
+    sql = ("SELECT pct_code, level, distance, description_full "
+           "FROM vec_embeddings WHERE embedding MATCH ? AND k = ? AND chapter = ?")
+    if level:
+        sql += " AND level = ?"
     sql += " ORDER BY distance"
-    rows = con.execute(sql, params).fetchall()
-    if prefixes is not None:
-        rows = [r for r in rows if any(r[0].startswith(p) for p in prefixes)]
-    return rows[:k]
 
-
-def retrieve(embedding_description: str, n_chap: int = N_CHAP,
-             n_head: int = N_HEAD, k_nat: int = K_NAT):
-    """Hierarchical drill-down: chapter -> heading -> subheading, all scored on
-    the `embedding_own` vectors (own text, top parents discarded). No DB writes.
-
-    Stage 1  KNN chapters                        -> keep best n_chap chapter codes
-    Stage 2  KNN headings within those chapters  -> keep best n_head heading codes
-    Stage 3  KNN subheadings within those heads  -> return top k_nat (final answer,
-             the HS6 leaf)
-    """
-    con = _connect()
-    blob = struct.pack(f"{DIM}f", *embed(embedding_description).tolist())
-
-    print(f"\n{'='*72}\nHIERARCHICAL CASCADE (embedding_own, cosine)\n{'='*72}")
-    print(f"query: {embedding_description!r}")
-    print(f"knobs: N_CHAP={n_chap} N_HEAD={n_head} K_NAT={k_nat}\n")
-
-    # Stage 1 — chapters (own = chapter title). KNN over all chapter rows.
-    chap = _knn_own(con, blob, "chapter", n_chap)
-    print("-- stage 1: chapters --")
-    for code, dist, own in chap:
-        print(f"   sim {1-dist:.4f}  ch {code}  {own[:70]}")
-    chap_codes = [c for c, _, _ in chap]
-    if not chap_codes:
-        print("!! no chapter hit"); con.close(); return
-
-    # Stage 2 — headings within the winning chapter(s). vec0 KNN takes one
-    # `chapter =` value, so query per chapter and merge by distance.
-    head = []
-    for ch in chap_codes:
-        head += _knn_own(con, blob, "heading", n_head, chapter=ch)
-    head.sort(key=lambda r: r[1])
-    head = head[:n_head]
-    print("\n-- stage 2: headings --")
-    for code, dist, own in head:
-        print(f"   sim {1-dist:.4f}  {code:8s} {own[:66]}")
-    head_codes = [c for c, _, _ in head]
-    if not head_codes:
-        print("!! no heading hit"); con.close(); return
-
-    # heading pct_code is "NNNN" (4-digit, no dot); subheading codes are
-    # "NNNN.XX" — strip the dot so the prefix filter matches the HS6 leaves
-    # under the heading (e.g. heading "4202" -> "4202" matches "420221").
-    head_prefixes = [c.replace(".", "") for c in head_codes]
-    # subheading rows all sit in the heading's chapter — pass it as a legal vec0
-    # pre-filter to shrink the pool before the Python prefix filter.
-    nat_chapter = head_codes[0][:2] if len(chap_codes) == 1 else None
-
-    # Stage 3 — subheadings within the winning heading(s) = the final answer.
-    nat = _knn_own(con, blob, "subheading", k_nat,
-                   prefixes=head_prefixes, chapter=nat_chapter)
-    print(f"\n-- stage 3: TOP {k_nat} SUBHEADING (HS6) CODES --")
-    for code, dist, own in nat:
-        full = con.execute(
-            "SELECT description_full FROM vec_embeddings WHERE pct_code = ?",
-            (code,),
-        ).fetchone()[0]
-        print(f"   sim {1-dist:.4f}  {code:11s}")
-        print(f"               own : {own}")
-        print(f"               full: {full}\n")
+    rows = []
+    for ch in chapters:
+        params = [blob, k, ch] + ([level] if level else [])
+        rows += con.execute(sql, params).fetchall()
     con.close()
+
+    rows.sort(key=lambda r: r[2])  # global nearest across the gated chapters
+    rows = rows[:k]
+
+    tag = f" [level={level}]" if level else ""
+    print(f"\n{'='*72}\nRETRIEVE: top {SHOW_N} of {len(rows)} cosine candidates"
+          f"{tag}  gate=chapters {chapters}\n{'='*72}")
+    print(f"query: {embedding_description!r}\n")
+    for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
+        print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
+        print(f"            {desc_full}\n")
+    return rows
+
+
+_rerank_model = None
+
+
+def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
+    global _rerank_model
+    if not candidates:
+        print("\n!! no candidates to rerank")
+        return []
+    if _rerank_model is None:
+        import torch
+        from sentence_transformers import CrossEncoder
+        if RERANK_DEVICE == "cpu":
+            torch.set_num_threads(max(1, (torch.get_num_threads() or 4) // 2))
+        _rerank_model = CrossEncoder(RERANK_MODEL, device=RERANK_DEVICE)
+
+    docs = [c[3] for c in candidates]
+    pairs = [(embedding_description, d) for d in docs]
+    scores = _rerank_model.predict(pairs, prompt=RERANK_INSTRUCT)
+
+    ranked = sorted(
+        ((float(s), c[0], c[1], c[3]) for s, c in zip(scores, candidates)),
+        key=lambda x: -x[0],
+    )
+
+    print(f"\n{'='*72}\nRERANK: top {show_n} of {len(candidates)} "
+          f"(Qwen3-Reranker-0.6B)\n{'='*72}")
+    print(f"query: {embedding_description!r}\n")
+    for score, pct_code, lvl, desc_full in ranked[:show_n]:
+        print(f"score {score:+.4f}  {pct_code:11s} [{lvl}]")
+        print(f"            {desc_full}\n")
+    return ranked
 
 
 def main():
     image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+    image_url = to_image_url(image)
+
+    chapters = load_chapters()
+    valid_codes = {c for c, _ in chapters}
+    catalog = "\n".join(f"{c} {title}" for c, title in chapters)
+    prompt = PROMPT.format(chapter_catalog=catalog, n_chapters=N_CHAPTERS)
 
     resp = client.chat.completions.create(
         model=MODEL,
         messages=[{
             "role": "user",
             "content": [
-                {"type": "image_url", "image_url": {"url": to_image_url(image)}},
-                {"type": "text", "text": PROMPT},
+                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "text", "text": prompt},
             ],
         }],
         max_tokens=14000,
@@ -271,12 +274,26 @@ def main():
         return
     print(json.dumps(parsed, indent=2))
 
-    # embed the embedding_description and retrieve nearest corpus codes (no save)
     desc = (parsed.get("embedding_description") or "").strip()
-    if desc:
-        retrieve(desc)
-    else:
+    if not desc:
         print("\n!! no embedding_description in output — skipping retrieval")
+        return
+
+    # Normalize the model's chapter picks: 2-digit, valid, deduped, order kept.
+    picked, seen = [], set()
+    for c in parsed.get("chapters", []):
+        c = str(c).strip().zfill(2)
+        if c in valid_codes and c not in seen:
+            seen.add(c)
+            picked.append(c)
+    picked = picked[:N_CHAPTERS]
+
+    if not picked:
+        print("\n!! model returned no valid chapters — cannot gate retrieval")
+        return
+
+    candidates = retrieve(desc, picked)
+    rerank(desc, candidates)
 
 
 if __name__ == "__main__":

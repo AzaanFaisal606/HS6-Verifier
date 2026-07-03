@@ -2,9 +2,12 @@
 """Phase 2: parse cached Flexport HTS chapter HTML into hst/hst_corpus.db.
 
 HS6 ceiling: emits chapter / heading / subheading rows only. Codes + levels
-come from id="hs-<digits>" anchors; names + grouping labels from visible cells;
-indentation dots are ignored (proven unreliable). See
-docs/superpowers/specs/2026-06-30-hst-corpus-design.md.
+come from id="hs-<digits>" anchors; names + grouping labels from visible cells.
+Indent dots do NOT encode code level (proven unreliable for that), but the dot on
+a *bare 6-digit* row DOES reliably mark grouping-label membership: dots=0 =
+standalone subheading, dots>=1 = nested under the active label. 10-digit rows
+never render dots, so 10-digit-only synthetics carry no signal (_STANDALONE_OVERRIDE).
+See docs/superpowers/specs/2026-06-30-hst-corpus-design.md and docs/issues.md.
 """
 import argparse
 import re
@@ -43,6 +46,19 @@ _LABEL_RE = re.compile(
 _ID_RE = re.compile(r'id="hs-(\d+)"')
 # own name (desktop variant shown first)
 _NAME_RE = re.compile(r'class="hidden md:block">(.*?)<', re.S)
+# visual indent marker div: one `·` per nesting level (text-gray-300)
+_DOT = "·"
+
+# --- Standalone override (see docs/issues.md Issue 6 "grouping-label leak") ---
+# A colSpan grouping label governs only the HS6 rows nested UNDER it; a standalone
+# subheading at heading level must NOT inherit it. The group-exit signal is the
+# `·` indent dot on the establishing anchor: 0 dots => standalone, >=1 => nested.
+# This works for 6-, 8-, AND 10-digit establishers (10-digit rows DO carry the dot,
+# just deep in the row markup — see the load-bearing full-chunk count below). So the
+# universal rule catches every leak and this override is EMPTY by design. Verified:
+# with it empty, description_full is unique across all 7,116 rows. Kept only as a
+# hand escape-hatch for any future semantic leak the dot count genuinely can't see.
+_STANDALONE_OVERRIDE: set[str] = set()
 
 
 def _clean(s: str) -> str:
@@ -95,13 +111,18 @@ def parse_chapter(html: str) -> list[dict]:
         end = heads[i + 1].start() if i + 1 < len(heads) else len(html)
         section = html[start:end]
 
-        # One grouping label governs every following HS6 until the next label
-        # row appears (no label nesting occurs at the HS6 level — verified across
-        # the corpus: zero back-to-back label rows). A new label REPLACES the
-        # active group; emitting an HS6 does NOT clear it, so sibling HS6 sharing
-        # one colSpan label (e.g. 4202.11 / 4202.12 under "Trunks, suitcases ...
-        # school satchels and similar containers") all inherit it. The buffer is
-        # re-init'd per heading section, so labels never leak across headings.
+        # A colSpan grouping label (rendered at indent dots=0) governs only the
+        # HS6 rows nested UNDER it — those render their bare-6 anchor at dots>=1
+        # (e.g. 4202.11 / 4202.12 under "Trunks, suitcases ... school satchels").
+        # A *standalone* subheading sits back at heading level: its bare-6 anchor
+        # renders at dots=0, and it must NOT inherit the active label (nor may the
+        # label leak to following siblings). So a bare-6 row at dots=0 CLEARS the
+        # active label. (Deeper national-line labels like "Motors"/"DC" are never
+        # picked up here: _LABEL_RE's bare `><div>` only matches dots=0 HS6-group
+        # labels; indented labels lead with a `text-gray-300` dot div.) A new
+        # label REPLACES the active one. Buffer re-init'd per heading section so
+        # labels never leak across headings. 10-digit-only synthetic standalones
+        # carry no indent signal and are handled by _STANDALONE_OVERRIDE above.
         group_label: str | None = None
         seen6: set[str] = set()
         for chunk in _TR_SPLIT.split(section):
@@ -119,6 +140,20 @@ def parse_chapter(html: str) -> list[dict]:
             if six in seen6:
                 continue  # 8/10-digit child of an already-emitted HS6 -> skip
             seen6.add(six)
+            # Standalone detection (universal, all digit lengths). The `·` indent
+            # dot on an establishing row is the nesting depth: a subheading nested
+            # under a colSpan grouping label renders >=1 dot, a standalone at
+            # heading level renders 0. So dots==0 => this row is NOT under the
+            # active label -> clear it. Verified across 6/8/10-digit establishers:
+            # nested members (8501.64 under "AC generators"; 0106.11 "Primates"
+            # under "Mammals") carry dots>=1; leaks (1902.20 stuffed pasta wrongly
+            # under "Uncooked pasta, not stuffed"; 0101.30 "Asses" wrongly under
+            # "Horses"; 0102.90 residual "Other" under "Buffalo") carry dots==0.
+            # NB: the dot can sit deep in the row markup (mobile-variant cell), so
+            # count over the WHOLE chunk, never a truncated prefix. The override
+            # remains only for the rare semantic case the dot count can't reach.
+            if chunk.count(_DOT) == 0 or six in _STANDALONE_OVERRIDE:
+                group_label = None
             nm = _NAME_RE.search(chunk)
             raw = _clean(nm.group(1)) if nm else ""
             full_parts = (
