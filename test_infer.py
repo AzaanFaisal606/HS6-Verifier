@@ -197,8 +197,9 @@ def reinfer(image_url: str, prev_desc: str, candidates: list,
                 {"type": "text", "text": prompt},
             ],
         }],
-        max_tokens=14000,
-        temperature=0.3,
+        max_tokens=2500,
+        temperature=0.1,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     msg = resp.choices[0].message
     content = (msg.content or "").strip()
@@ -264,8 +265,9 @@ def main():
                 {"type": "text", "text": PROMPT},
             ],
         }],
-        max_tokens=14000,
-        temperature=0.3,
+        max_tokens=2500,
+        temperature=0.1,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     msg = resp.choices[0].message
     reasoning = getattr(msg, "reasoning_content", None)

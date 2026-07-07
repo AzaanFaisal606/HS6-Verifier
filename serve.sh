@@ -4,7 +4,12 @@
 #   ./serve.sh > vllm.log 2>&1 &  # background
 set -euo pipefail
 
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
+# The cuda-nvcc conda activation script expands ${NVCC_PREPEND_FLAGS} and
+# ${NVCC_APPEND_FLAGS} unguarded, which aborts under `set -u`. Pre-define them.
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"
+export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:-}"
+
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
 conda activate vision
 
 # =============================================================================
@@ -50,45 +55,10 @@ exec vllm serve "$MODEL" \
 #     chapter-gate prompt's thinking budget). Costs GPU KV -> go slow.
 
 # =============================================================================
-# ROLLBACK CONFIG: nvidia/Qwen3.6-27B-NVFP4 (CPU offload) — see 27b.md. Does NOT
-# work on this box (no sm_120 native NVFP4 kernel; host-RAM balloon at profiling).
-# Kept commented for reference only. ALWAYS launch inside the cgroup cap if tried.
+# NVFP4 27B ATTEMPT: moved out of this repo, isolated at
+# ~/Desktop/nvfp4-27b/ (own launcher, own conda env). See that folder's
+# 27b.md for full history — do not resurrect the old inline config here.
 # =============================================================================
-# MODEL="nvidia/Qwen3.6-27B-NVFP4"
-# exec vllm serve "$MODEL" \
-#   --served-model-name qwen3-vl \
-#   --max-model-len 4096 \
-#   --gpu-memory-utilization 0.90 \
-#   --cpu-offload-gb 11 \
-#   --enforce-eager \
-#   --kv-cache-dtype fp8 \
-#   --max-num-seqs 1 \
-#   --tensor-parallel-size 1 \
-#   --trust-remote-code \
-#   --limit-mm-per-prompt '{"image":1,"video":0}' \
-#   --mm-processor-kwargs '{"max_pixels": 200704}' \
-#   --reasoning-parser qwen3 \
-#   --port 8000
-
-# =============================================================================
-# CANDIDATE CONFIG: unsloth/Qwen3.6-27B-NVFP4 (25GB single shard) — superseded
-# by nvidia's smaller 22GB build above. Kept for reference; offload 15.
-# =============================================================================
-# MODEL="unsloth/Qwen3.6-27B-NVFP4"
-# exec vllm serve "$MODEL" \
-#   --served-model-name qwen3-vl \
-#   --max-model-len 4096 \
-#   --gpu-memory-utilization 0.88 \
-#   --cpu-offload-gb 15 \
-#   --enforce-eager \
-#   --kv-cache-dtype fp8 \
-#   --max-num-seqs 1 \
-#   --tensor-parallel-size 1 \
-#   --trust-remote-code \
-#   --limit-mm-per-prompt '{"image":1,"video":0}' \
-#   --mm-processor-kwargs '{"max_pixels": 802816}' \
-#   --reasoning-parser qwen3 \
-#   --port 8000
 
 # =============================================================================
 # PREVIOUS CONFIG: Qwen/Qwen3-VL-8B-Thinking-FP8

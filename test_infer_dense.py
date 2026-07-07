@@ -69,7 +69,7 @@ Here is the full list of HS chapters (2-digit code + title):
 RULES:
 - Describe ONLY the product. NEVER mention background, surface it rests on,
   lighting, or photo setting.
-- State what general category it comes under (e.g. Bovine anime, Data processing machine, Organic chemical).
+- State what general category it comes under (e.g. Bovine animal, Data processing machine, Organic chemical).
 - State what the object IS (its common article name: e.g. wallet, purse,
   belt, key-case).
 - HOW it is used / HOW it functions.
@@ -251,8 +251,9 @@ def main():
                 {"type": "text", "text": prompt},
             ],
         }],
-        max_tokens=14000,
-        temperature=0.3,
+        max_tokens=2000,
+        temperature=0.1,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
     msg = resp.choices[0].message
     reasoning = getattr(msg, "reasoning_content", None)
