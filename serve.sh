@@ -1,77 +1,65 @@
 #!/usr/bin/env bash
-# Serve a Qwen VLM via vLLM (OpenAI-compatible API on :8000).
-#   ./serve.sh                    # foreground
+# ACTIVE: single Qwen3.5-4B (BF16) via vLLM on :8000, served as Qwen/Qwen3.5-4B-BF16.
+# served-model-name = the FULL model name + quant so clients that store it (e.g.
+# build_ai_corpus.py -> ai_corpus.db model_name) record the exact model+precision.
+# NOTE: test_infer*.py still use model id "qwen3-vl" — update those if you point
+# them here, or add "qwen3-vl" as a second --served-model-name alias.
+# Runs in the vision conda env.
+#
+#   ./serve.sh                    # foreground (blocks)
 #   ./serve.sh > vllm.log 2>&1 &  # background
+#
+# Stop:  pkill -9 -f vllm   (verify VRAM freed: nvidia-smi)
 set -euo pipefail
 
-# The cuda-nvcc conda activation script expands ${NVCC_PREPEND_FLAGS} and
-# ${NVCC_APPEND_FLAGS} unguarded, which aborts under `set -u`. Pre-define them.
-export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"
-export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:-}"
-
+export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-}"   # guard: cuda-nvcc activation
+export NVCC_APPEND_FLAGS="${NVCC_APPEND_FLAGS:-}"     #        expands these under set -u
 source "$HOME/miniforge3/etc/profile.d/conda.sh"
 conda activate vision
-
-# =============================================================================
-# ACTIVE CONFIG: Qwen/Qwen3.5-4B (BF16) — 16384 ctx, fits the chapter-catalog
-# prompt easily; no offload. This is the working box config for this machine.
-# =============================================================================
-MODEL="Qwen/Qwen3.5-4B"
-
-exec vllm serve "$MODEL" \
-  --served-model-name qwen3-vl \
+exec vllm serve "Qwen/Qwen3.5-4B" \
+  --served-model-name "Qwen/Qwen3.5-4B-BF16" \
   --max-model-len 16384 \
   --gpu-memory-utilization 0.90 \
   --enforce-eager \
   --kv-cache-dtype fp8 \
   --max-num-seqs 2 \
-  --tensor-parallel-size 1 \
   --trust-remote-code \
   --limit-mm-per-prompt '{"image":1,"video":0}' \
   --mm-processor-kwargs '{"max_pixels": 802816}' \
   --reasoning-parser qwen3 \
   --port 8000
 
-# !! ALWAYS LAUNCH INSIDE THE CGROUP CAP. History:
-#   - offload 12 UNCAPPED: host RAM spiked during mm-profiling, Windows RESET the
-#     whole vmmem VM (killed SSH + tmux). HOST OOM = catastrophic.
-#   - offload 9 CAPPED: on-GPU weights = 10.83GiB > the 0.90 util budget (10.75GiB)
-#     -> GPU OOM at profiling. Only vllm died; VM survived. GPU OOM = safe.
-#   Lesson: WSL sets pin_memory=False so the offload is pageable/swappable (NOT
-#   pinned). The real failure point is GPU-at-profiling, and LESS offload puts
-#   MORE weight on GPU -> worse. The cgroup cap makes host overruns kill vllm (not
-#   the VM), so bias offload HIGHER for GPU headroom and let the cap guard host.
-#   Launch:
-#      tmux new-session -d -s vllm27 \
-#        "systemd-run --user --scope -p MemoryMax=25G --unit=vllm27 \
-#         bash -c './serve.sh 2>&1 | tee vllm.log'"
-# Tuning (only after a clean, capped boot):
-#   GPU OOM at profiling -> RAISE --cpu-offload-gb (less on GPU) and/or drop
-#     max_pixels. on-GPU weights must sit well under gpu-mem-util*12227 to leave
-#     room for KV + the vision-profiling forward (offload 12 -> ~7.84GiB on GPU).
-#   host near the 25G cap -> the cap must stay < (WSL mem - ~2.5G baseline) or the
-#     VM itself OOMs; with WSL memory=28GB that ceiling is ~25G. Don't exceed it.
-#   need thinking room -> raise --max-model-len toward 8192 (4096 truncates the
-#     chapter-gate prompt's thinking budget). Costs GPU KV -> go slow.
-
 # =============================================================================
-# NVFP4 27B ATTEMPT: moved out of this repo, isolated at
-# ~/Desktop/nvfp4-27b/ (own launcher, own conda env). See that folder's
-# 27b.md for full history — do not resurrect the old inline config here.
+# PRESERVED: TWO-VLM ensemble via llama.cpp (llama-server, OpenAI-compatible).
+#   InternVL3.5-4B  -> :8000  (served-model-name: internvl)
+#   Qwen3.5-4B      -> :8001  (served-model-name: qwen)
+# Both GGUF Q4_K_M + F16 mmproj (vision projector), all layers on GPU (-ngl 99).
+# test_infer_ensemble.py fans out to both endpoints; RRF-fuses the two lists.
+# To use it, comment out the vLLM block above and uncomment this whole block.
+# Stop:  pkill -f llama-server   (verify VRAM freed: nvidia-smi)
 # =============================================================================
-
-# =============================================================================
-# PREVIOUS CONFIG: Qwen/Qwen3-VL-8B-Thinking-FP8
-# =============================================================================
-# MODEL="Qwen/Qwen3-VL-8B-Thinking-FP8"
-# exec vllm serve "$MODEL" \
-#   --served-model-name qwen3-vl \
-#   --max-model-len 3072 \
-#   --gpu-memory-utilization 0.90 \
-#   --enforce-eager \
-#   --kv-cache-dtype fp8 \
-#   --max-num-seqs 2 \
-#   --limit-mm-per-prompt '{"image":1,"video":0}' \
-#   --mm-processor-kwargs '{"max_pixels": 802816}' \
-#   --reasoning-parser qwen3 \
-#   --port 8000
+# LLAMA_DIR="$HOME/Desktop/llama-cuda"          # extracted keypaa sm120/cu12.8 build
+# LLAMA_SERVER="$LLAMA_DIR/bin/llama-server"    # binaries in bin/, libs in lib/
+# MODELS="$HOME/Desktop/models"
+#
+# INTERNVL_GGUF="$MODELS/InternVL3_5-4B-GGUF/InternVL3_5-4B-Q4_K_M.gguf"
+# INTERNVL_MMPROJ="$MODELS/InternVL3_5-4B-GGUF/mmproj-model-f16.gguf"
+# QWEN_GGUF="$MODELS/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q4_K_M.gguf"
+# QWEN_MMPROJ="$MODELS/Qwen3.5-4B-GGUF/mmproj-F16.gguf"
+#
+# # keypaa build lacks CUDA runtime libs; vision env's pip nvidia-* provide them.
+# VENV="$HOME/miniforge3/envs/vision"
+# NV_LIBS="$(find "$VENV/lib/python3.12/site-packages/nvidia" -name lib -type d 2>/dev/null | tr '\n' ':')"
+# export LD_LIBRARY_PATH="$LLAMA_DIR/lib:$VENV/lib:$NV_LIBS${LD_LIBRARY_PATH:-}"
+#
+# COMMON=(--n-gpu-layers 99 -c 8192 --host 0.0.0.0 --flash-attn on)
+#
+# "$LLAMA_SERVER" -m "$INTERNVL_GGUF" --mmproj "$INTERNVL_MMPROJ" \
+#   --alias internvl --port 8000 "${COMMON[@]}" &
+# INTERNVL_PID=$!
+# "$LLAMA_SERVER" -m "$QWEN_GGUF" --mmproj "$QWEN_MMPROJ" \
+#   --alias qwen --port 8001 "${COMMON[@]}" &
+# QWEN_PID=$!
+# echo "internvl -> :8000 (pid $INTERNVL_PID)   qwen -> :8001 (pid $QWEN_PID)"
+# echo "stop: pkill -f llama-server"
+# wait

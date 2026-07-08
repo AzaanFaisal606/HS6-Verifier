@@ -12,8 +12,13 @@ __pycache__/
 *.pyc
 *.log
 hst/hts_cache/
-hst/hst_corpus.db
 images/
+
+# SQLite corpora + their WAL/shm sidecars (large, regenerable)
+hst/*.db
+hst/*.db-wal
+hst/*.db-shm
+hst/*.db.bak
 
 # NVFP4 / 27B experiment scaffolding (external, non-runnable on this box)
 nvfp4/

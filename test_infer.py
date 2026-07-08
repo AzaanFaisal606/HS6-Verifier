@@ -289,15 +289,33 @@ def main():
         return
     print(json.dumps(parsed, indent=2))
 
-    desc = (parsed.get("embedding_description") or "").strip()
-    if desc:
-        candidates = retrieve(desc)
-        new_desc = reinfer(image_url, desc, candidates)
-        if new_desc != desc:
-            candidates = retrieve(new_desc)
-        rerank(new_desc, candidates)
-    else:
+    base_desc = (parsed.get("embedding_description") or "").strip()
+    if not base_desc:
         print("\n!! no embedding_description in output — skipping retrieval")
+        return
+    # Composed query (small_changes.md 2026-07-07): append function + category
+    # to embedding_description so the discriminator (often in `function`, Issue 1)
+    # and the article category reach the embedded/reranked text. func+cat come
+    # from the ORIGINAL caption JSON (reinfer only rewrites embedding_description),
+    # and are appended to BOTH the pre-reinfer and post-reinfer queries.
+    func = (parsed.get("function") or "").strip()
+    cat = (parsed.get("category") or "").strip()
+
+    def compose(base: str) -> str:
+        parts = [base]
+        if func:
+            parts.append(f"Function: {func}.")
+        if cat:
+            parts.append(f"Category: {cat}.")
+        return " ".join(parts)
+
+    desc = compose(base_desc)
+    candidates = retrieve(desc)
+    new_base = reinfer(image_url, base_desc, candidates)
+    new_desc = compose(new_base)
+    if new_desc != desc:
+        candidates = retrieve(new_desc)
+    rerank(new_desc, candidates)
 
 
 if __name__ == "__main__":

@@ -275,10 +275,21 @@ def main():
         return
     print(json.dumps(parsed, indent=2))
 
-    desc = (parsed.get("embedding_description") or "").strip()
-    if not desc:
+    base_desc = (parsed.get("embedding_description") or "").strip()
+    if not base_desc:
         print("\n!! no embedding_description in output — skipping retrieval")
         return
+    # Composed query (small_changes.md 2026-07-07): append function + category
+    # to embedding_description so the discriminator (often placed in `function`,
+    # Issue 1) and the coarse category actually reach the embedded text.
+    func = (parsed.get("function") or "").strip()
+    cat = (parsed.get("category") or "").strip()
+    parts = [base_desc]
+    if func:
+        parts.append(f"Function: {func}.")
+    if cat:
+        parts.append(f"Category: {cat}.")
+    desc = " ".join(parts)
 
     # Normalize the model's chapter picks: 2-digit, valid, deduped, order kept.
     picked, seen = [], set()

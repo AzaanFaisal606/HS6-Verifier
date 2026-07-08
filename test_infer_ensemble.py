@@ -35,12 +35,23 @@ import sqlite_vec
 from openai import OpenAI
 
 # --- Ensemble config -------------------------------------------------------
-ENDPOINT = "http://localhost:8000/v1"   # one vLLM server, OpenAI-compatible
-VLM_MODELS = ["qwen3-vl", "qwen3-vl"]   # two model ids on the SAME endpoint
+# Two llama.cpp servers (llama-server), one GGUF VLM each, on separate ports.
+# Each entry is (base_url, model_id). model_id = the server's --alias.
+VLM_MODELS = [
+    ("http://localhost:8000/v1", "internvl"),   # InternVL3.5-4B-GGUF
+    ("http://localhost:8001/v1", "qwen"),        # Qwen3.5-4B-GGUF
+]
 RRF_K = 60                               # RRF constant; higher = flatter weighting
 FUSION_METHOD = "rrf"                    # only "rrf" implemented
 
-client = OpenAI(base_url=ENDPOINT, api_key="EMPTY")
+# One OpenAI client per endpoint (base_url differs per model), keyed by base_url.
+_clients = {}
+
+
+def client_for(base_url: str) -> OpenAI:
+    if base_url not in _clients:
+        _clients[base_url] = OpenAI(base_url=base_url, api_key="EMPTY")
+    return _clients[base_url]
 
 DEFAULT_IMG = "test.jpeg"
 
@@ -49,7 +60,7 @@ DB = Path(__file__).resolve().parent / "hst" / "hst_corpus.db"
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
 RERANK_MODEL = "Qwen/Qwen3-Reranker-0.6B"
 DIM = 1024
-TOP_K = 50
+TOP_K = 30
 SHOW_N = 5
 EMBED_DEVICE = "cpu"
 RERANK_DEVICE = "cpu"
@@ -119,11 +130,11 @@ def extract_json(text: str) -> str:
     return text
 
 
-def caption(image_url: str, model_id: str):
-    """One VLM call for one model. Returns the parsed JSON dict, or None if the
-    model produced no usable JSON (so the caller can drop this model's vote).
+def caption(image_url: str, base_url: str, model_id: str):
+    """One VLM call for one model on its own endpoint. Returns the parsed JSON
+    dict, or None if the model produced no usable JSON (drop this model's vote).
     """
-    resp = client.chat.completions.create(
+    resp = client_for(base_url).chat.completions.create(
         model=model_id,
         messages=[{
             "role": "user",
@@ -132,7 +143,7 @@ def caption(image_url: str, model_id: str):
                 {"type": "text", "text": PROMPT},
             ],
         }],
-        max_tokens=2500,
+        max_tokens=4000,
         temperature=0.1,
         extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
@@ -290,8 +301,8 @@ def main():
     image_url = to_image_url(image)
 
     ranked_lists = []
-    for model_id in VLM_MODELS:
-        parsed = caption(image_url, model_id)
+    for base_url, model_id in VLM_MODELS:
+        parsed = caption(image_url, base_url, model_id)
         if parsed is None:
             continue
         desc = (parsed.get("embedding_description") or "").strip()
