@@ -130,7 +130,7 @@ def extract_json(text: str) -> str:
     return text
 
 
-def caption(image_url: str, base_url: str, model_id: str):
+def caption(image_url: str, base_url: str, model_id: str, verbose: bool = True):
     """One VLM call for one model on its own endpoint. Returns the parsed JSON
     dict, or None if the model produced no usable JSON (drop this model's vote).
     """
@@ -151,21 +151,24 @@ def caption(image_url: str, base_url: str, model_id: str):
     reasoning = getattr(msg, "reasoning_content", None)
     content = (msg.content or "").strip()
 
-    print(f"{'='*72}\nMODEL OUTPUT [{model_id}]\n{'='*72}")
-    if reasoning:
-        print("--- thinking ---")
-        print(reasoning.strip())
-        print("--- output ---")
-    print(content)
-    print(f"\n[usage] {resp.usage}  finish={resp.choices[0].finish_reason}")
+    if verbose:
+        print(f"{'='*72}\nMODEL OUTPUT [{model_id}]\n{'='*72}")
+        if reasoning:
+            print("--- thinking ---")
+            print(reasoning.strip())
+            print("--- output ---")
+        print(content)
+        print(f"\n[usage] {resp.usage}  finish={resp.choices[0].finish_reason}")
 
     try:
         parsed = json.loads(extract_json(content))
     except json.JSONDecodeError as e:
-        print(f"!! [{model_id}] JSON parse failed: {e} — dropping this model")
+        if verbose:
+            print(f"!! [{model_id}] JSON parse failed: {e} — dropping this model")
         return None
-    print(f"\n{'='*72}\nPARSED JSON [{model_id}]\n{'='*72}")
-    print(json.dumps(parsed, indent=2))
+    if verbose:
+        print(f"\n{'='*72}\nPARSED JSON [{model_id}]\n{'='*72}")
+        print(json.dumps(parsed, indent=2))
     return parsed
 
 
@@ -184,7 +187,8 @@ def embed(text: str):
     )[0]
 
 
-def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading"):
+def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading",
+             verbose: bool = True):
     """Flat KNN on `embedding` (description_full), pre-filtered to `level`."""
     con = sqlite3.connect(DB)
     con.enable_load_extension(True)
@@ -203,23 +207,26 @@ def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheadin
     rows = con.execute(sql, params).fetchall()
     con.close()
 
-    tag = f" [level={level}]" if level else ""
-    print(f"\n{'='*72}\nRETRIEVE: top {SHOW_N} of {len(rows)} cosine candidates"
-          f"{tag}\n{'='*72}")
-    print(f"query: {embedding_description!r}\n")
-    for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
-        print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
-        print(f"            {desc_full}\n")
+    if verbose:
+        tag = f" [level={level}]" if level else ""
+        print(f"\n{'='*72}\nRETRIEVE: top {SHOW_N} of {len(rows)} cosine candidates"
+              f"{tag}\n{'='*72}")
+        print(f"query: {embedding_description!r}\n")
+        for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
+            print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
+            print(f"            {desc_full}\n")
     return rows
 
 
 _rerank_model = None
 
 
-def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
+def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N,
+           verbose: bool = True):
     global _rerank_model
     if not candidates:
-        print("\n!! no candidates to rerank")
+        if verbose:
+            print("\n!! no candidates to rerank")
         return []
     if _rerank_model is None:
         import torch
@@ -237,16 +244,18 @@ def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
         key=lambda x: -x[0],
     )
 
-    print(f"\n{'='*72}\nRERANK: top {show_n} of {len(candidates)} "
-          f"(Qwen3-Reranker-0.6B)\n{'='*72}")
-    print(f"query: {embedding_description!r}\n")
-    for score, pct_code, lvl, desc_full in ranked[:show_n]:
-        print(f"score {score:+.4f}  {pct_code:11s} [{lvl}]")
-        print(f"            {desc_full}\n")
+    if verbose:
+        print(f"\n{'='*72}\nRERANK: top {show_n} of {len(candidates)} "
+              f"(Qwen3-Reranker-0.6B)\n{'='*72}")
+        print(f"query: {embedding_description!r}\n")
+        for score, pct_code, lvl, desc_full in ranked[:show_n]:
+            print(f"score {score:+.4f}  {pct_code:11s} [{lvl}]")
+            print(f"            {desc_full}\n")
     return ranked
 
 
-def rrf_fuse(ranked_lists: list, k: int = RRF_K, show_n: int = SHOW_N):
+def rrf_fuse(ranked_lists: list, k: int = RRF_K, show_n: int = SHOW_N,
+             verbose: bool = True):
     """Reciprocal Rank Fusion over per-model rerank lists.
 
     Each list is rerank() output: [(score, pct_code, level, desc_full), ...],
@@ -259,7 +268,8 @@ def rrf_fuse(ranked_lists: list, k: int = RRF_K, show_n: int = SHOW_N):
     """
     lists = [rl for rl in ranked_lists if rl]
     if not lists:
-        print("\n!! no ranked lists to fuse")
+        if verbose:
+            print("\n!! no ranked lists to fuse")
         return []
 
     scores = {}    # pct_code -> rrf score
@@ -280,43 +290,100 @@ def rrf_fuse(ranked_lists: list, k: int = RRF_K, show_n: int = SHOW_N):
         key=lambda x: -x[0],
     )
 
-    print(f"\n{'='*72}\nRRF FUSION: top {show_n} of {len(fused)} fused codes"
-          f"  (k={k}, {len(lists)} model list(s))\n{'='*72}")
-    for rrf_score, pct_code, lvl, desc_full, per_ranks in fused[:show_n]:
-        rank_str = ", ".join(
-            f"m{i}=#{r}" if r is not None else f"m{i}=—"
-            for i, r in enumerate(per_ranks)
-        )
-        print(f"rrf {rrf_score:.5f}  {pct_code:11s} [{lvl}]  ({rank_str})")
-        print(f"            {desc_full}\n")
+    if verbose:
+        print(f"\n{'='*72}\nRRF FUSION: top {show_n} of {len(fused)} fused codes"
+              f"  (k={k}, {len(lists)} model list(s))\n{'='*72}")
+        for rrf_score, pct_code, lvl, desc_full, per_ranks in fused[:show_n]:
+            rank_str = ", ".join(
+                f"m{i}=#{r}" if r is not None else f"m{i}=—"
+                for i, r in enumerate(per_ranks)
+            )
+            print(f"rrf {rrf_score:.5f}  {pct_code:11s} [{lvl}]  ({rank_str})")
+            print(f"            {desc_full}\n")
     return fused
 
 
-def main():
-    if FUSION_METHOD != "rrf":
-        print(f"!! FUSION_METHOD={FUSION_METHOD!r} not implemented (only 'rrf')")
-        return
+def norm6(code) -> str:
+    """Normalize an HS code to NNNN.NN (6-digit subheading form)."""
+    digits = "".join(ch for ch in str(code) if ch.isdigit())[:6]
+    return f"{digits[:4]}.{digits[4:6]}" if len(digits) >= 6 else str(code)
 
-    image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+
+def classify(image: str, verbose: bool = False) -> dict:
+    """Run the two-VLM RRF ensemble flow.
+
+    Each VLM captions the image, runs retrieve->rerank; the reranked lists are
+    fused with RRF. Prints section blocks only when verbose=True; always returns
+    the standard result dict:
+
+        {flow, hs6, description, query, caption, chapters, candidates, meta}
+
+    `query` is the first surviving model's embedded description; `caption` is
+    that model's parsed JSON. candidates carry the RRF score
+    (score_type='rrf') plus per-model contributing ranks in meta. On failure
+    (no model produced a usable list) returns a dict with error set, hs6=None.
+    """
+    def err(msg_):
+        if verbose:
+            print(f"\n!! {msg_}")
+        return {"flow": "ensemble", "hs6": None, "description": None,
+                "query": None, "caption": None, "chapters": [],
+                "candidates": [], "meta": {}, "error": msg_}
+
+    if FUSION_METHOD != "rrf":
+        return err(f"FUSION_METHOD={FUSION_METHOD!r} not implemented (only 'rrf')")
+
     image_url = to_image_url(image)
 
     ranked_lists = []
+    first_query = None
+    first_caption = None
+    model_ids = []
     for base_url, model_id in VLM_MODELS:
-        parsed = caption(image_url, base_url, model_id)
+        parsed = caption(image_url, base_url, model_id, verbose=verbose)
         if parsed is None:
             continue
         desc = (parsed.get("embedding_description") or "").strip()
         if not desc:
-            print(f"\n!! [{model_id}] no embedding_description — dropping this model")
+            if verbose:
+                print(f"\n!! [{model_id}] no embedding_description — dropping this model")
             continue
-        candidates = retrieve(desc)
-        ranked_lists.append(rerank(desc, candidates))
+        if first_query is None:
+            first_query = desc
+            first_caption = parsed
+        candidates = retrieve(desc, verbose=verbose)
+        ranked_lists.append(rerank(desc, candidates, verbose=verbose))
+        model_ids.append(model_id)
 
     if not ranked_lists:
-        print("\n!! no model produced a usable ranked list — nothing to fuse")
-        return
+        return err("no model produced a usable ranked list — nothing to fuse")
 
-    rrf_fuse(ranked_lists)
+    fused = rrf_fuse(ranked_lists, verbose=verbose)
+    if not fused:
+        out = err("empty fusion result")
+        out["query"] = first_query
+        out["caption"] = first_caption
+        return out
+
+    cands = [{"hs6": norm6(pc), "description": dfull, "score": rrf_score,
+              "score_type": "rrf", "level": lvl, "per_model_ranks": per_ranks}
+             for rrf_score, pc, lvl, dfull, per_ranks in fused[:SHOW_N]]
+    top = cands[0]
+    return {
+        "flow": "ensemble",
+        "hs6": top["hs6"],
+        "description": top["description"],
+        "query": first_query,
+        "caption": first_caption,
+        "chapters": [],
+        "candidates": cands,
+        "meta": {"models": model_ids, "n_lists_fused": len(ranked_lists)},
+    }
+
+
+def main():
+    image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+    classify(image, verbose=True)
 
 
 if __name__ == "__main__":

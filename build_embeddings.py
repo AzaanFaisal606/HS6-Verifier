@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
-"""Embed every `codes.description_full` into a sqlite-vec virtual table.
+"""Embed each `codes` row THREE ways into a sqlite-vec virtual table.
 
-Builds the `vec_embeddings` vec0 table inside the SAME pct_corpus.db, next to the
-relational `codes` table. The corpus is small (~14k rows) so a brute-force vec0
-table is plenty.
+Builds the `vec_embeddings` vec0 table inside the SAME corpus db, next to the
+relational `codes` table. The corpus is small (~7k rows) so a brute-force vec0
+table is plenty. Three vector columns, one per text register:
+
+  embedding      <- description_full  (chapter > heading > [groups] > own)
+  embedding_own  <- description_own   (same chain, top parents sliced off)
+  embedding_ai   <- description_ai    (register-normalized rewrite; subheading
+                                       rows only — other levels fall back to
+                                       description_full so every row has a vector)
 
 sqlite-vec virtual tables cannot declare a foreign key, so `pct_code` is carried
 as a filterable metadata column and used as a logical FK back to codes.pct_code
 for joins. `level` and `chapter` are also stored as filterable metadata so KNN
-queries can be pre-filtered cheaply. `description_full` is an auxiliary (+) column
-— a side-car copy for quick debug display without a join.
+queries can be pre-filtered cheaply. The `description_*` auxiliary (+) columns
+are side-car copies for quick debug display without a join.
 
-Embedding model: BAAI/bge-small-en-v1.5 (384-dim) via sentence-transformers.
+Embedding model: Qwen/Qwen3-Embedding-0.6B (1024-dim) via sentence-transformers.
 Distance metric: cosine (vectors are L2-normalized, so cosine == dot).
 
-Run:  python3 build_embeddings.py            # embed all rows
-      python3 build_embeddings.py --query "wiring harness for cars"
+Run:  python3 build_embeddings.py --db hst/hst_corpus.db      # embed all rows
+      python3 build_embeddings.py --query "leather wallet" --column embedding_ai
 """
 
 import argparse
@@ -134,17 +140,19 @@ def build(db_path: Path, device: str = "cpu"):
         CREATE VIRTUAL TABLE vec_embeddings USING vec0(
             embedding         FLOAT[{DIM}] distance_metric=cosine,
             embedding_own     FLOAT[{DIM}] distance_metric=cosine,
+            embedding_ai      FLOAT[{DIM}] distance_metric=cosine,
             pct_code          TEXT,
             level             TEXT,
             chapter           TEXT,
             +description_full TEXT,
-            +description_own  TEXT
+            +description_own  TEXT,
+            +description_ai   TEXT
         )
         """
     )
 
     rows = con.execute(
-        "SELECT pct_code, level, description_full FROM codes "
+        "SELECT pct_code, level, description_full, description_ai FROM codes "
         "WHERE description_full IS NOT NULL AND description_full != '' "
         "ORDER BY pct_code"
     ).fetchall()
@@ -158,27 +166,38 @@ def build(db_path: Path, device: str = "cpu"):
     # subheading rows, or empty-raw rows) so every row still carries an
     # embedding_own vector — the cascade just never queries the skipped levels.
     own_texts = [own.get(r[0]) or r[2] for r in rows]
+    # description_ai is the register-normalized rewrite, written by
+    # hst/build_ai_desc.py on SUBHEADING rows only. Chapter/heading rows have
+    # none, so they fall back to the full chain — every row keeps a vector, and
+    # a client querying embedding_ai at level='subheading' only ever sees real
+    # rewrites.
+    ai_texts = [(r[3] or r[2]).strip() or r[2] for r in rows]
+    n_ai = sum(1 for r in rows if (r[3] or "").strip())
+    print(f"description_ai present on {n_ai}/{len(rows)} rows "
+          f"(rest fall back to description_full)")
 
     print("embedding description_full ...")
     full_vecs = embed_texts(model, full_texts)
     print("embedding description_own ...")
     own_vecs = embed_texts(model, own_texts)
+    print("embedding description_ai ...")
+    ai_vecs = embed_texts(model, ai_texts)
 
     payload = []
-    for (pct_code, level, desc_full), fvec, ovec, otext in zip(
-        rows, full_vecs, own_vecs, own_texts
+    for (pct_code, level, desc_full, _), fvec, ovec, avec, otext, atext in zip(
+        rows, full_vecs, own_vecs, ai_vecs, own_texts, ai_texts
     ):
         chapter = pct_code[:2]
         payload.append(
-            (pack(fvec.tolist()), pack(ovec.tolist()),
-             pct_code, level, chapter, desc_full, otext)
+            (pack(fvec.tolist()), pack(ovec.tolist()), pack(avec.tolist()),
+             pct_code, level, chapter, desc_full, otext, atext)
         )
 
     con.executemany(
         "INSERT INTO vec_embeddings"
-        "(embedding, embedding_own, pct_code, level, chapter, "
-        " description_full, description_own) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(embedding, embedding_own, embedding_ai, pct_code, level, chapter, "
+        " description_full, description_own, description_ai) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         payload,
     )
     con.commit()
@@ -188,14 +207,26 @@ def build(db_path: Path, device: str = "cpu"):
     con.close()
 
 
+# vector column -> the aux text column it was built from (for result display).
+VEC_COLUMNS = {
+    "embedding": "description_full",
+    "embedding_own": "description_own",
+    "embedding_ai": "description_ai",
+}
+
+
 def query(db_path: Path, text: str, k: int = 8, level: str | None = None,
-          chapter: str | None = None, device: str = "cpu"):
+          chapter: str | None = None, device: str = "cpu",
+          column: str = "embedding"):
+    if column not in VEC_COLUMNS:
+        sys.exit(f"unknown --column {column!r}; pick one of "
+                 f"{', '.join(VEC_COLUMNS)}")
     con = connect(db_path)
     model = load_model(device)
     # query side gets the Qwen3-Embedding task instruction; corpus side is raw.
     qvec = embed_texts(model, [query_text(text)])[0]
 
-    where = ["embedding MATCH ?", "k = ?"]
+    where = [f"{column} MATCH ?", "k = ?"]
     params: list = [pack(qvec.tolist()), k]
     # metadata pre-filters (optional)
     if level:
@@ -204,13 +235,14 @@ def query(db_path: Path, text: str, k: int = 8, level: str | None = None,
     if chapter:
         where.append("chapter = ?")
         params.append(chapter)
+    text_col = VEC_COLUMNS[column]
     sql = (
-        "SELECT pct_code, level, chapter, distance, description_full "
+        f"SELECT pct_code, level, chapter, distance, {text_col} "
         "FROM vec_embeddings WHERE " + " AND ".join(where) + " ORDER BY distance"
     )
-    print(f"\nquery: {text!r}\n" + "-" * 70)
+    print(f"\nquery: {text!r}  [{column}]\n" + "-" * 70)
     for pct_code, lvl, ch, dist, desc in con.execute(sql, params):
-        print(f"{dist:.4f}  {pct_code:11s} [{lvl:10s}] {desc[:90]}")
+        print(f"{dist:.4f}  {pct_code:11s} [{lvl:10s}] {(desc or '')[:90]}")
     con.close()
 
 
@@ -221,6 +253,10 @@ def main():
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--level", help="filter results to a level")
     ap.add_argument("--chapter", help="filter results to a 2-digit chapter")
+    ap.add_argument("--column", default="embedding", choices=sorted(VEC_COLUMNS),
+                    help="which vector column --query scores against: embedding "
+                         "(description_full), embedding_own (description_own), "
+                         "embedding_ai (description_ai rewrite).")
     ap.add_argument("--device", default="cpu",
                     help="torch device for the embedder: cpu (default, safe to "
                          "run alongside the vLLM server) or cuda (faster; only "
@@ -229,7 +265,7 @@ def main():
 
     if args.query:
         query(Path(args.db), args.query, args.k, args.level, args.chapter,
-              args.device)
+              args.device, args.column)
     else:
         build(Path(args.db), args.device)
 

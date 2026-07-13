@@ -103,7 +103,8 @@ def embed(text: str):
     )[0]
 
 
-def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading"):
+def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheading",
+             verbose: bool = True):
     con = sqlite3.connect(DB)
     con.enable_load_extension(True)
     sqlite_vec.load(con)
@@ -121,13 +122,14 @@ def retrieve(embedding_description: str, k: int = TOP_K, level: str = "subheadin
     rows = con.execute(sql, params).fetchall()
     con.close()
 
-    tag = f" [level={level}]" if level else ""
-    print(f"\n{'='*72}\nRETRIEVE: top {SHOW_N} of {len(rows)} cosine candidates"
-          f"{tag}\n{'='*72}")
-    print(f"query: {embedding_description!r}\n")
-    for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
-        print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
-        print(f"            {desc_full}\n")
+    if verbose:
+        tag = f" [level={level}]" if level else ""
+        print(f"\n{'='*72}\nRETRIEVE: top {SHOW_N} of {len(rows)} cosine candidates"
+              f"{tag}\n{'='*72}")
+        print(f"query: {embedding_description!r}\n")
+        for pct_code, lvl, dist, desc_full in rows[:SHOW_N]:
+            print(f"sim {1 - dist:.4f}  {pct_code:11s} [{lvl}]")
+            print(f"            {desc_full}\n")
     return rows
 
 
@@ -164,9 +166,10 @@ Output ONLY this JSON (nothing after):
 
 
 def reinfer(image_url: str, prev_desc: str, candidates: list,
-            n_chapters: int = REINFER_CHAPTERS):
+            n_chapters: int = REINFER_CHAPTERS, verbose: bool = True):
     if not candidates:
-        print("\n!! reinfer: no candidates — keeping previous description")
+        if verbose:
+            print("\n!! reinfer: no candidates — keeping previous description")
         return prev_desc
 
     samples = []
@@ -183,10 +186,11 @@ def reinfer(image_url: str, prev_desc: str, candidates: list,
     samples_block = "\n".join(f"- {desc}" for _, desc in samples)
     prompt = REINFER_PROMPT.format(samples=samples_block, prev_desc=prev_desc)
 
-    print(f"\n{'='*72}\nREINFER: {len(samples)} distinct-chapter style sample(s)"
-          f"\n{'='*72}")
-    for pct_code, desc in samples:
-        print(f"  [{str(pct_code)[:2]}] {pct_code}: {desc}")
+    if verbose:
+        print(f"\n{'='*72}\nREINFER: {len(samples)} distinct-chapter style sample(s)"
+              f"\n{'='*72}")
+        for pct_code, desc in samples:
+            print(f"  [{str(pct_code)[:2]}] {pct_code}: {desc}")
 
     resp = client.chat.completions.create(
         model=MODEL,
@@ -207,25 +211,30 @@ def reinfer(image_url: str, prev_desc: str, candidates: list,
         new_desc = (json.loads(extract_json(content)).get(
             "embedding_description") or "").strip()
     except json.JSONDecodeError as e:
-        print(f"!! reinfer JSON parse failed: {e} — keeping previous description")
+        if verbose:
+            print(f"!! reinfer JSON parse failed: {e} — keeping previous description")
         return prev_desc
 
     if not new_desc:
-        print("!! reinfer produced no embedding_description — keeping previous")
+        if verbose:
+            print("!! reinfer produced no embedding_description — keeping previous")
         return prev_desc
 
-    print(f"\nprev: {prev_desc!r}")
-    print(f"new : {new_desc!r}")
+    if verbose:
+        print(f"\nprev: {prev_desc!r}")
+        print(f"new : {new_desc!r}")
     return new_desc
 
 
 _rerank_model = None
 
 
-def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
+def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N,
+           verbose: bool = True):
     global _rerank_model
     if not candidates:
-        print("\n!! no candidates to rerank")
+        if verbose:
+            print("\n!! no candidates to rerank")
         return []
     if _rerank_model is None:
         import torch
@@ -243,17 +252,34 @@ def rerank(embedding_description: str, candidates: list, show_n: int = SHOW_N):
         key=lambda x: -x[0],
     )
 
-    print(f"\n{'='*72}\nRERANK: top {show_n} of {len(candidates)} "
-          f"(Qwen3-Reranker-0.6B)\n{'='*72}")
-    print(f"query: {embedding_description!r}\n")
-    for score, pct_code, lvl, desc_full in ranked[:show_n]:
-        print(f"score {score:+.4f}  {pct_code:11s} [{lvl}]")
-        print(f"            {desc_full}\n")
+    if verbose:
+        print(f"\n{'='*72}\nRERANK: top {show_n} of {len(candidates)} "
+              f"(Qwen3-Reranker-0.6B)\n{'='*72}")
+        print(f"query: {embedding_description!r}\n")
+        for score, pct_code, lvl, desc_full in ranked[:show_n]:
+            print(f"score {score:+.4f}  {pct_code:11s} [{lvl}]")
+            print(f"            {desc_full}\n")
     return ranked
 
 
-def main():
-    image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+def norm6(code) -> str:
+    """Normalize an HS code to NNNN.NN (6-digit subheading form)."""
+    digits = "".join(ch for ch in str(code) if ch.isdigit())[:6]
+    return f"{digits[:4]}.{digits[4:6]}" if len(digits) >= 6 else str(code)
+
+
+def classify(image: str, verbose: bool = False) -> dict:
+    """Run the flat KNN + reinfer + rerank flow (test_infer's 'normal' pipeline).
+
+    Same logic and params as the CLI. Prints the section blocks only when
+    verbose=True; always returns the standard result dict:
+
+        {flow, hs6, description, query, caption, chapters, candidates, meta}
+
+    candidates: [{hs6, description, score, score_type, level}, ...] (top SHOW_N).
+    On any failure (bad JSON, no embedding_description, empty pool) returns a
+    dict with error set and hs6=None.
+    """
     image_url = to_image_url(image)
 
     resp = client.chat.completions.create(
@@ -273,26 +299,34 @@ def main():
     reasoning = getattr(msg, "reasoning_content", None)
     content = (msg.content or "").strip()
 
-    print(f"{'='*72}\nMODEL OUTPUT\n{'='*72}")
-    if reasoning:
-        print("--- thinking ---")
-        print(reasoning.strip())
-        print("--- output ---")
-    print(content)
-    print(f"\n[usage] {resp.usage}  finish={resp.choices[0].finish_reason}")
+    if verbose:
+        print(f"{'='*72}\nMODEL OUTPUT\n{'='*72}")
+        if reasoning:
+            print("--- thinking ---")
+            print(reasoning.strip())
+            print("--- output ---")
+        print(content)
+        print(f"\n[usage] {resp.usage}  finish={resp.choices[0].finish_reason}")
 
-    print(f"\n{'='*72}\nPARSED JSON\n{'='*72}")
+    def err(msg_):
+        if verbose:
+            print(f"\n!! {msg_}")
+        return {"flow": "normal", "hs6": None, "description": None,
+                "query": None, "caption": None, "chapters": [],
+                "candidates": [], "meta": {}, "error": msg_}
+
     try:
         parsed = json.loads(extract_json(content))
     except json.JSONDecodeError as e:
-        print(f"!! JSON parse failed: {e}")
-        return
-    print(json.dumps(parsed, indent=2))
+        return err(f"JSON parse failed: {e}")
+    if verbose:
+        print(f"\n{'='*72}\nPARSED JSON\n{'='*72}")
+        print(json.dumps(parsed, indent=2))
 
     base_desc = (parsed.get("embedding_description") or "").strip()
     if not base_desc:
-        print("\n!! no embedding_description in output — skipping retrieval")
-        return
+        return err("no embedding_description in output")
+
     # Composed query (small_changes.md 2026-07-07): append function + category
     # to embedding_description so the discriminator (often in `function`, Issue 1)
     # and the article category reach the embedded/reranked text. func+cat come
@@ -310,12 +344,38 @@ def main():
         return " ".join(parts)
 
     desc = compose(base_desc)
-    candidates = retrieve(desc)
-    new_base = reinfer(image_url, base_desc, candidates)
+    candidates = retrieve(desc, verbose=verbose)
+    new_base = reinfer(image_url, base_desc, candidates, verbose=verbose)
     new_desc = compose(new_base)
     if new_desc != desc:
-        candidates = retrieve(new_desc)
-    rerank(new_desc, candidates)
+        candidates = retrieve(new_desc, verbose=verbose)
+    ranked = rerank(new_desc, candidates, verbose=verbose)
+
+    if not ranked:
+        out = err("empty rerank pool")
+        out["query"] = new_desc
+        out["caption"] = parsed
+        return out
+
+    cands = [{"hs6": norm6(pc), "description": dfull, "score": sc,
+              "score_type": "rerank", "level": lvl}
+             for sc, pc, lvl, dfull in ranked[:SHOW_N]]
+    top = cands[0]
+    return {
+        "flow": "normal",
+        "hs6": top["hs6"],
+        "description": top["description"],
+        "query": new_desc,
+        "caption": parsed,
+        "chapters": [],
+        "candidates": cands,
+        "meta": {"reinfer_prev": base_desc, "reinfer_new": new_base},
+    }
+
+
+def main():
+    image = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_IMG
+    classify(image, verbose=True)
 
 
 if __name__ == "__main__":
